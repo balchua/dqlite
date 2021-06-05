@@ -64,8 +64,8 @@ int dqlite__init(struct dqlite_node *d,
 	/* TODO: expose these values through some API */
 	raft_set_election_timeout(&d->raft, 3000);
 	raft_set_heartbeat_timeout(&d->raft, 500);
-	raft_set_snapshot_threshold(&d->raft, 1024);
-	raft_set_snapshot_trailing(&d->raft, 8192);
+	raft_set_snapshot_threshold(&d->raft, 64);
+	raft_set_snapshot_trailing(&d->raft, 256);
 	raft_set_pre_vote(&d->raft, true);
 	raft_set_max_catch_up_rounds(&d->raft, 100);
 	raft_set_max_catch_up_round_duration(&d->raft, 50 * 1000); /* 50 secs */
