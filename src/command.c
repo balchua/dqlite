@@ -87,7 +87,7 @@ COMMAND__TYPES(COMMAND__IMPLEMENT, );
 
 int command__encode(int type, const void *command, struct raft_buffer *buf)
 {
-	struct header h;
+	struct header h = {0};
 	void *cursor;
 	int rc = 0;
 	h.format = FORMAT;
@@ -156,7 +156,7 @@ int command_frames__page_numbers(const struct command_frames *c,
 		if (r != 0) {
 			return r;
 		}
-		(*page_numbers)[i] = pgno;
+		(*page_numbers)[i] = (unsigned long)pgno;
 	}
 
 	return 0;

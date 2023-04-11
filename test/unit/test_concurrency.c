@@ -21,7 +21,8 @@ struct context
 {
 	bool invoked;
 	int status;
-	int type;
+	uint8_t type;
+	uint8_t schema;
 };
 
 /* Standalone leader database connection */
@@ -47,8 +48,10 @@ struct connection
 		struct connection *c = &f->connections[i];           \
 		struct request_open open;                            \
 		struct response_db db;                               \
+		struct id_state seed = {{1}};                        \
 		gateway__init(&c->gateway, CLUSTER_CONFIG(0),        \
-			      CLUSTER_REGISTRY(0), CLUSTER_RAFT(0)); \
+			      CLUSTER_REGISTRY(0), CLUSTER_RAFT(0),  \
+		              seed);                                 \
 		c->handle.data = &c->context;                        \
 		rc = buffer__init(&c->request);                      \
 		munit_assert_int(rc, ==, 0);                         \
@@ -73,12 +76,13 @@ struct connection
 	}                                                  \
 	TEAR_DOWN_CLUSTER;
 
-static void fixture_handle_cb(struct handle *req, int status, int type)
+static void fixture_handle_cb(struct handle *req, int status, uint8_t type, uint8_t schema)
 {
 	struct context *c = req->data;
 	c->invoked = true;
 	c->status = status;
 	c->type = type;
+	c->schema = schema;
 }
 
 /******************************************************************************
@@ -115,13 +119,12 @@ static void fixture_handle_cb(struct handle *req, int status, int type)
  * error occurs. */
 #define HANDLE(C, TYPE)                                                 \
 	{                                                               \
-		struct cursor cursor;                                   \
 		int rc2;                                                \
-		cursor.p = buffer__cursor(&C->request, 0);              \
-		cursor.cap = buffer__offset(&C->request);               \
+		C->handle.cursor.p = buffer__cursor(&C->request, 0);    \
+		C->handle.cursor.cap = buffer__offset(&C->request);     \
 		buffer__reset(&C->response);                            \
 		rc2 = gateway__handle(&C->gateway, &C->handle,          \
-				      DQLITE_REQUEST_##TYPE, &cursor,   \
+				      DQLITE_REQUEST_##TYPE, 0,         \
 				      &C->response, fixture_handle_cb); \
 		munit_assert_int(rc2, ==, 0);                           \
 	}
@@ -136,6 +139,7 @@ static void fixture_handle_cb(struct handle *req, int status, int type)
 		prepare.sql = SQL;              \
 		ENCODE(C, &prepare, prepare);   \
 		HANDLE(C, PREPARE);             \
+		WAIT(C);                        \
 		ASSERT_CALLBACK(C, 0, STMT);    \
 		DECODE(C, &stmt, stmt);         \
 		*(STMT_ID) = stmt.id;           \

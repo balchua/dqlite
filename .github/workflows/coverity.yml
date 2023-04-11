@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Download Coverity Build Tool
         run: |
@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo add-apt-repository -y ppa:dqlite/master
+          sudo add-apt-repository -y ppa:dqlite/dev
           sudo apt-get update -qq
           sudo apt-get install -qq gcc libsqlite3-dev liblz4-dev libuv1-dev libraft-dev
 

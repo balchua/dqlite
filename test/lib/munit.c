@@ -1349,17 +1349,23 @@ munit_test_runner_run_test_with_params(MunitTestRunner* runner, const MunitTest*
 
     fork_pid = fork();
     if (fork_pid == 0) {
+#if !defined(MUNIT_NO_BUFFER)
       int orig_stderr;
+#endif
 
       close(pipefd[0]);
 
+#if !defined(MUNIT_NO_BUFFER)
       orig_stderr = munit_replace_stderr(stderr_buf);
+#endif
       munit_test_runner_exec(runner, test, params, &report);
 
+#if !defined(MUNIT_NO_BUFFER)
       /* Note that we don't restore stderr.  This is so we can buffer
        * things written to stderr later on (such as by
        * asan/tsan/ubsan, valgrind, etc.) */
       close(orig_stderr);
+#endif
 
       do {
         write_res = write(pipefd[1], ((munit_uint8_t*) (&report)) + bytes_written, sizeof(report) - bytes_written);
@@ -1698,7 +1704,7 @@ munit_test_runner_run(MunitTestRunner* runner) {
 }
 
 static void
-munit_print_help(int argc, char* const argv[MUNIT_ARRAY_PARAM(argc + 1)], void* user_data, const MunitArgument arguments[]) {
+munit_print_help(int argc, char* const argv[MUNIT_ARRAY_PARAM(argc)], void* user_data, const MunitArgument arguments[]) {
   const MunitArgument* arg;
   (void) argc;
 
@@ -1834,7 +1840,7 @@ munit_stream_supports_ansi(FILE *stream) {
 
 int
 munit_suite_main_custom(const MunitSuite* suite, void* user_data,
-                        int argc, char* const argv[MUNIT_ARRAY_PARAM(argc + 1)],
+                        int argc, char* const argv[MUNIT_ARRAY_PARAM(argc)],
                         const MunitArgument arguments[]) {
   int result = EXIT_FAILURE;
   MunitTestRunner runner;
@@ -2051,6 +2057,6 @@ munit_suite_main_custom(const MunitSuite* suite, void* user_data,
 
 int
 munit_suite_main(const MunitSuite* suite, void* user_data,
-                 int argc, char* const argv[MUNIT_ARRAY_PARAM(argc + 1)]) {
+                 int argc, char* const argv[MUNIT_ARRAY_PARAM(argc)]) {
   return munit_suite_main_custom(suite, user_data, argc, argv, NULL);
 }

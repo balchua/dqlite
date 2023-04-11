@@ -4,6 +4,7 @@
 #include "../../src/response.h"
 #include "../../src/tuple.h"
 #include "../lib/cluster.h"
+#include "../lib/raft_heap.h"
 #include "../lib/runner.h"
 
 TEST_MODULE(gateway);
@@ -19,7 +20,8 @@ struct context
 {
 	bool invoked;
 	int status;
-	int type;
+	uint8_t type;
+	uint8_t schema;
 };
 
 /* Drive a single gateway. Each gateway is associated with a different raft
@@ -51,20 +53,23 @@ struct connection
 	for (i = 0; i < N_SERVERS; i++) {                               \
 		struct connection *c = &f->connections[i];              \
 		struct config *config;                                  \
+		struct id_state seed = {{1}};                           \
 		config = CLUSTER_CONFIG(i);                             \
 		config->page_size = 512;                                \
 		gateway__init(&c->gateway, config, CLUSTER_REGISTRY(i), \
-			      CLUSTER_RAFT(i));                         \
+			      CLUSTER_RAFT(i), seed);                   \
 		c->handle.data = &c->context;                           \
 		rc = buffer__init(&c->buf1);                            \
 		munit_assert_int(rc, ==, 0);                            \
 		rc = buffer__init(&c->buf2);                            \
 		munit_assert_int(rc, ==, 0);                            \
 	}                                                               \
+	test_raft_heap_setup(params, user_data);                        \
 	SELECT(0)
 
 #define TEAR_DOWN                                          \
 	unsigned i;                                        \
+	test_raft_heap_tear_down(data);                    \
 	for (i = 0; i < N_SERVERS; i++) {                  \
 		struct connection *c = &f->connections[i]; \
 		gateway__close(&c->gateway);               \
@@ -73,12 +78,13 @@ struct connection
 	}                                                  \
 	TEAR_DOWN_CLUSTER;
 
-static void handleCb(struct handle *req, int status, int type)
+static void handleCb(struct handle *req, int status, uint8_t type, uint8_t schema)
 {
 	struct context *c = req->data;
 	c->invoked = true;
 	c->status = status;
 	c->type = type;
+	c->schema = schema;
 }
 
 /******************************************************************************
@@ -108,14 +114,14 @@ static void handleCb(struct handle *req, int status, int type)
 		request_##LOWER##__encode(REQUEST, &cursor);    \
 	}
 
-/* Encode N parameters with the given values */
-#define ENCODE_PARAMS(N, VALUES)                                              \
+/* Encode N parameters with the given values in the given format */
+#define ENCODE_PARAMS(N, VALUES, FORMAT)                                      \
 	{                                                                     \
 		struct tuple_encoder encoder;                                 \
-		int i2;                                                       \
+		unsigned long i2;                                             \
 		int rc2;                                                      \
 		rc2 =                                                         \
-		    tuple_encoder__init(&encoder, N, TUPLE__PARAMS, f->buf1); \
+		    tuple_encoder__init(&encoder, N, FORMAT, f->buf1); \
 		munit_assert_int(rc2, ==, 0);                                 \
 		for (i2 = 0; i2 < N; i2++) {                                  \
 			rc2 = tuple_encoder__next(&encoder, &((VALUES)[i2])); \
@@ -133,34 +139,39 @@ static void handleCb(struct handle *req, int status, int type)
 	}
 
 /* Decode a row with N columns filling the given values. */
-#define DECODE_ROW(N, VALUES)                                                 \
-	{                                                                     \
-		struct tuple_decoder decoder;                                 \
-		int i2;                                                       \
-		int rc2;                                                      \
-		rc2 = tuple_decoder__init(&decoder, N, f->cursor);            \
-		munit_assert_int(rc2, ==, 0);                                 \
-		for (i2 = 0; i2 < N; i2++) {                                  \
-			rc2 = tuple_decoder__next(&decoder, &((VALUES)[i2])); \
-			munit_assert_int(rc2, ==, 0);                         \
-		}                                                             \
+#define DECODE_ROW(N, VALUES)                                                  \
+	{                                                                      \
+		struct tuple_decoder decoder;                                  \
+		int i2;                                                        \
+		int rc2;                                                       \
+		rc2 = tuple_decoder__init(&decoder, N, TUPLE__ROW, f->cursor); \
+		munit_assert_int(rc2, ==, 0);                                  \
+		for (i2 = 0; i2 < N; i2++) {                                   \
+			rc2 = tuple_decoder__next(&decoder, &((VALUES)[i2]));  \
+			munit_assert_int(rc2, ==, 0);                          \
+		}                                                              \
 	}
 
-/* Handle a request of the given type and check that no error occurs. */
-#define HANDLE(TYPE)                                                    \
-	{                                                               \
-		int rc2;                                                \
-		f->cursor->p = buffer__cursor(f->buf1, 0);              \
-		f->cursor->cap = buffer__offset(f->buf1);               \
-		buffer__reset(f->buf2);                                 \
-		f->context->invoked = false;                            \
-		f->context->status = -1;                                \
-		f->context->type = -1;                                  \
-		rc2 = gateway__handle(f->gateway, f->handle,            \
-				      DQLITE_REQUEST_##TYPE, f->cursor, \
-				      f->buf2, handleCb);               \
-		munit_assert_int(rc2, ==, 0);                           \
+#define HANDLE_SCHEMA_STATUS(TYPE, SCHEMA, RC)                    \
+	{                                                         \
+		int rc2;                                          \
+		f->handle->cursor.p = buffer__cursor(f->buf1, 0); \
+		f->handle->cursor.cap = buffer__offset(f->buf1);  \
+		buffer__reset(f->buf2);                           \
+		f->context->invoked = false;                      \
+		f->context->status = -1;                          \
+		f->context->type = -1;                            \
+		rc2 = gateway__handle(f->gateway, f->handle,      \
+				      TYPE, SCHEMA,               \
+				      f->buf2, handleCb);         \
+		munit_assert_int(rc2, ==, RC);                    \
 	}
+
+/* Handle a request of the given type and check for the given return code. */
+#define HANDLE_STATUS(TYPE, RC) HANDLE_SCHEMA_STATUS(TYPE, 0, RC)
+
+/* Handle a request of the given type and check that no error occurs. */
+#define HANDLE(TYPE) HANDLE_STATUS(DQLITE_REQUEST_##TYPE, 0)
 
 /* Open a leader connection against the "test" database */
 #define OPEN                              \
@@ -182,6 +193,7 @@ static void handleCb(struct handle *req, int status, int type)
 		prepare.sql = SQL;              \
 		ENCODE(&prepare, prepare);      \
 		HANDLE(PREPARE);                \
+		WAIT;                           \
 		ASSERT_CALLBACK(0, STMT);       \
 		DECODE(&stmt, stmt);            \
 		stmt_id = stmt.id;              \
@@ -218,6 +230,16 @@ static void handleCb(struct handle *req, int status, int type)
 		HANDLE(EXEC_SQL);                 \
 	}
 
+/* Submit a request to execute the given statement. */
+#define QUERY_SQL_SUBMIT(SQL)                       \
+	{                                           \
+		struct request_query_sql query_sql; \
+		query_sql.db_id = 0;                \
+		query_sql.sql = SQL;                \
+		ENCODE(&query_sql, query_sql);      \
+		HANDLE(QUERY_SQL);                  \
+	}
+
 /* Wait for the last request to complete */
 #define WAIT                                            \
 	{                                               \
@@ -241,6 +263,7 @@ static void handleCb(struct handle *req, int status, int type)
 		prepare.sql = SQL;              \
 		ENCODE(&prepare, prepare);      \
 		HANDLE(PREPARE);                \
+		WAIT;                           \
 		ASSERT_CALLBACK(0, STMT);       \
 		DECODE(&stmt, stmt);            \
 		_stmt_id = stmt.id;             \
@@ -451,11 +474,203 @@ TEST_CASE(prepare, success, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT)";
+	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
+	WAIT;
 	ASSERT_CALLBACK(0, STMT);
 	DECODE(&f->response, stmt);
 	munit_assert_int(f->response.id, ==, 0);
+	return MUNIT_OK;
+}
+
+/* Prepare an empty statement. */
+TEST_CASE(prepare, empty1, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "";
+	CLUSTER_ELECT(0);
+	ENCODE(&f->request, prepare);
+	HANDLE(PREPARE);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(0, "empty statement");
+	munit_assert_int(f->response.id, ==, 0);
+	return MUNIT_OK;
+}
+
+/* Prepare an empty statement. */
+TEST_CASE(prepare, empty2, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = " -- This is a comment";
+	CLUSTER_ELECT(0);
+	ENCODE(&f->request, prepare);
+	HANDLE(PREPARE);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(0, "empty statement");
+	munit_assert_int(f->response.id, ==, 0);
+	return MUNIT_OK;
+}
+
+/* Prepare an invalid statement. */
+TEST_CASE(prepare, invalid, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "NOT SQL";
+	CLUSTER_ELECT(0);
+	ENCODE(&f->request, prepare);
+	HANDLE(PREPARE);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "near \"NOT\": syntax error");
+	munit_assert_int(f->response.id, ==, 0);
+	return MUNIT_OK;
+}
+
+/* Prepare a statement and close the gateway early. */
+TEST_CASE(prepare, closing, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+
+	f->request.db_id = 0;
+	f->request.sql = "CREATE TABLE test (n INT)";
+	ENCODE(&f->request, prepare);
+	CLUSTER_ELECT(0);
+	HANDLE(PREPARE);
+	return MUNIT_OK;
+}
+
+/* Submit a prepare request that triggers a failed barrier operation. */
+TEST_CASE(prepare, barrier_error, NULL)
+{
+	struct prepare_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	/* Set up an uncommitted exec operation */
+	CLUSTER_ELECT(0);
+	PREPARE("CREATE TABLE test (n INT)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Submit a prepare request, forcing a barrier, which fails */
+	CLUSTER_ELECT(0);
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, prepare);
+	/* We rely on leader__barrier (called by handle_prepare) attempting
+	 * an allocation using raft_malloc. */
+	test_raft_heap_fault_config(0, 1);
+	test_raft_heap_fault_enable();
+	HANDLE_STATUS(DQLITE_REQUEST_PREPARE, RAFT_NOMEM);
+	return MUNIT_OK;
+}
+
+/* Submit a prepare request to a non-leader node. */
+TEST_CASE(prepare, non_leader, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+
+	CLUSTER_ELECT(0);
+	SELECT(1);
+	f->request.db_id = 0;
+	f->request.sql = "CREATE TABLE test (n INT)";
+	ENCODE(&f->request, prepare);
+	HANDLE(PREPARE);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_IOERR_NOT_LEADER, "not leader");
+	return MUNIT_OK;
+}
+
+/* Try to prepare a string containing more than one statement. */
+TEST_CASE(prepare, nonempty_tail, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "CREATE TABLE test (n INT); SELECT * FROM test";
+	CLUSTER_ELECT(0);
+	ENCODE(&f->request, prepare);
+	HANDLE(PREPARE);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "nonempty statement tail");
+	return MUNIT_OK;
+}
+
+/* Try to prepare a string containing a comment after the statement. */
+TEST_CASE(prepare, comment_in_tail, NULL)
+{
+	struct prepare_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "CREATE TABLE test (n INT); /* comment */";
+	CLUSTER_ELECT(0);
+	ENCODE(&f->request, prepare);
+	HANDLE(PREPARE);
+	WAIT;
+	ASSERT_CALLBACK(0, STMT);
+	return MUNIT_OK;
+}
+
+/* Try to prepare a string containing more than one statement, successfully. */
+TEST_CASE(prepare, nonempty_tail_v1, NULL)
+{
+	struct prepare_fixture *f = data;
+	struct response_stmt_with_offset response = {0};
+	struct request_exec exec = {0};
+	uint64_t offset;
+	int rc;
+
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "CREATE TABLE test (n INT); SELECT * FROM test";
+	CLUSTER_ELECT(0);
+	ENCODE(&f->request, prepare);
+	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_PREPARE, 1, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, STMT_WITH_OFFSET);
+	DECODE(&response, stmt_with_offset);
+	munit_assert_int(response.id, ==, 0);
+	munit_assert_uint64(response.offset, ==, 26);
+	offset = response.offset;
+
+	ENCODE(&exec, exec);
+	f->handle->cursor.p = buffer__cursor(f->buf1, 0);
+	f->handle->cursor.cap = buffer__offset(f->buf1);
+	buffer__reset(f->buf2);
+	f->context->invoked = false;
+	f->context->status = -1;
+	f->context->type = -1;
+	rc = gateway__handle(f->gateway, f->handle,
+				DQLITE_REQUEST_EXEC,
+				DQLITE_REQUEST_PARAMS_SCHEMA_V0,
+				f->buf2, handleCb);
+	munit_assert_int(rc, ==, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+
+	f->request.sql += offset;
+	ENCODE(&f->request, prepare);
+	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_PREPARE, 1, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, STMT_WITH_OFFSET);
+	DECODE(&response, stmt_with_offset);
+	munit_assert_int(response.id, ==, 1);
+	munit_assert_uint64(response.offset, ==, 19);
+
 	return MUNIT_OK;
 }
 
@@ -499,7 +714,7 @@ TEST_CASE(exec, simple, NULL)
 	f->request.stmt_id = stmt_id;
 	ENCODE(&f->request, exec);
 	HANDLE(EXEC);
-	CLUSTER_APPLIED(2);
+	WAIT;
 	ASSERT_CALLBACK(0, RESULT);
 	DECODE(&f->response, result);
 	munit_assert_int(f->response.last_insert_id, ==, 0);
@@ -525,9 +740,9 @@ TEST_CASE(exec, one_param, NULL)
 	ENCODE(&f->request, exec);
 	value.type = SQLITE_INTEGER;
 	value.integer = 7;
-	ENCODE_PARAMS(1, &value);
+	ENCODE_PARAMS(1, &value, TUPLE__PARAMS);
 	HANDLE(EXEC);
-	CLUSTER_APPLIED(3);
+	WAIT;
 	ASSERT_CALLBACK(0, RESULT);
 	DECODE(&f->response, result);
 	munit_assert_int(f->response.last_insert_id, ==, 1);
@@ -559,9 +774,9 @@ TEST_CASE(exec, blob, NULL)
 	value.type = SQLITE_BLOB;
 	value.blob.base = buf;
 	value.blob.len = sizeof buf;
-	ENCODE_PARAMS(1, &value);
+	ENCODE_PARAMS(1, &value, TUPLE__PARAMS);
 	HANDLE(EXEC);
-	CLUSTER_APPLIED(3);
+	WAIT;
 	ASSERT_CALLBACK(0, RESULT);
 	DECODE(&f->response, result);
 	munit_assert_int(f->response.last_insert_id, ==, 1);
@@ -893,7 +1108,74 @@ TEST_CASE(exec, restore, NULL)
 	munit_assert_int(value.type, ==, SQLITE_INTEGER);
 	munit_assert_int(value.integer, ==, 2);
 	DECODE(&response, rows);
-	munit_assert_ulong(response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
+	munit_assert_ullong(response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
+	return MUNIT_OK;
+}
+
+/* Close the gateway early while an exec barrier is in flight. */
+TEST_CASE(exec, barrier_closing, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id, prev_stmt_id;
+	(void)params;
+
+	CLUSTER_ELECT(0);
+	EXEC("CREATE TABLE test (n INT)");
+
+	/* Save this stmt to exec later */
+	PREPARE("INSERT INTO test(n) VALUES(2)");
+	prev_stmt_id = stmt_id;
+
+	/* Submit exec request, then depose the leader before it commits */
+	PREPARE("INSERT INTO test(n) VALUES(1)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Now try to exec the other stmt (triggering a barrier) and close early */
+	CLUSTER_ELECT(0);
+	EXEC_SUBMIT(prev_stmt_id);
+	return MUNIT_OK;
+}
+
+/* Send an exec request in the new (schema version 1) format, which
+ * supports larger numbers of parameters. */
+TEST_CASE(exec, manyParams, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id;
+	size_t len = 20000;
+	char *sql = munit_malloc(len);
+	size_t pos;
+	size_t i;
+	size_t num_exec_params = 999;
+	struct value *values = munit_calloc(num_exec_params, sizeof(*values));
+	(void)params;
+
+	pos = snprintf(sql, len, "DELETE FROM test WHERE n = ?");
+	for (i = 1; i < num_exec_params; i++) {
+		pos += snprintf(sql + pos, len - pos, " OR n = ?");
+	}
+
+	for (i = 0; i < num_exec_params; i++) {
+		values[i].type = SQLITE_INTEGER;
+		values[i].integer = i;
+	}
+
+	CLUSTER_ELECT(0);
+	EXEC("CREATE TABLE test (n INT)");
+	PREPARE(sql);
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, exec);
+	ENCODE_PARAMS(num_exec_params, values, TUPLE__PARAMS32);
+	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_EXEC, 1, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+
+	FINALIZE(stmt_id);
+	free(values);
+	free(sql);
 	return MUNIT_OK;
 }
 
@@ -947,7 +1229,7 @@ TEST_CASE(query, simple, NULL)
 	text__decode(f->cursor, &column);
 	munit_assert_string_equal(column, "n");
 	DECODE(&f->response, rows);
-	munit_assert_ulong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
 
 	return MUNIT_OK;
 }
@@ -978,9 +1260,19 @@ TEST_CASE(query, one_row, NULL)
 	munit_assert_int(value.type, ==, SQLITE_INTEGER);
 	munit_assert_int(value.integer, ==, 666);
 	DECODE(&f->response, rows);
-	munit_assert_ulong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
 
 	return MUNIT_OK;
+}
+
+/* Calculate max amount of rows that can fit in 1 response buffer.
+ * A response buffer has _SC_PAGESIZE size.
+ * A response consists of n tuples each row_sz in size
+ * and an 8B EOF marker. */
+static unsigned max_rows_buffer(unsigned tuple_row_sz) {
+	unsigned buf_sz = sysconf(_SC_PAGESIZE);
+	unsigned eof_sz = 8;
+	return (buf_sz - eof_sz) / tuple_row_sz;
 }
 
 /* Successfully query that yields a large number of rows that need to be split
@@ -996,7 +1288,12 @@ TEST_CASE(query, large, NULL)
 	bool finished;
 	(void)params;
 	EXEC("BEGIN");
-	for (i = 0; i < 500; i++) {
+
+	/* 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	/* Insert 1 less than 2 response buffers worth of rows, otherwise we need
+	 * 3 responses, of which the last one contains no rows. */
+	for (i = 0; i < ((2 * n_rows_buffer) - 1); i++) {
 		EXEC("INSERT INTO test(n) VALUES(123)");
 	}
 	EXEC("COMMIT");
@@ -1013,14 +1310,15 @@ TEST_CASE(query, large, NULL)
 	text__decode(f->cursor, &column);
 	munit_assert_string_equal(column, "n");
 
-	for (i = 0; i < 255; i++) {
+	/* First response contains max amount of rows */
+	for (i = 0; i < n_rows_buffer; i++) {
 		DECODE_ROW(1, &value);
 		munit_assert_int(value.type, ==, SQLITE_INTEGER);
 		munit_assert_int(value.integer, ==, 123);
 	}
 
 	DECODE(&f->response, rows);
-	munit_assert_ulong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
 
 	gateway__resume(f->gateway, &finished);
 	munit_assert_false(finished);
@@ -1032,15 +1330,18 @@ TEST_CASE(query, large, NULL)
 	text__decode(f->cursor, &column);
 	munit_assert_string_equal(column, "n");
 
-	for (i = 0; i < 245; i++) {
+	/* Second, and last, response contains 1 less than maximum amount */
+	for (i = 0; i < n_rows_buffer - 1; i++) {
 		DECODE_ROW(1, &value);
 		munit_assert_int(value.type, ==, SQLITE_INTEGER);
 		munit_assert_int(value.integer, ==, 123);
 	}
 
 	DECODE(&f->response, rows);
-	munit_assert_ulong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
 
+	gateway__resume(f->gateway, &finished);
+	munit_assert_true(finished);
 	return MUNIT_OK;
 }
 
@@ -1067,7 +1368,7 @@ TEST_CASE(query, params, NULL)
 	values[0].integer = 1;
 	values[1].type = SQLITE_INTEGER;
 	values[1].integer = 4;
-	ENCODE_PARAMS(2, values);
+	ENCODE_PARAMS(2, values, TUPLE__PARAMS);
 
 	HANDLE(QUERY);
 	ASSERT_CALLBACK(0, ROWS);
@@ -1086,7 +1387,11 @@ TEST_CASE(query, interrupt, NULL)
 	struct value value;
 	(void)params;
 	EXEC("BEGIN");
-	for (i = 0; i < 500; i++) {
+
+	/* 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	/* Insert 2 response buffers worth of rows */
+	for (i = 0; i < 2 * n_rows_buffer; i++) {
 		EXEC("INSERT INTO test(n) VALUES(123)");
 	}
 	EXEC("COMMIT");
@@ -1103,19 +1408,77 @@ TEST_CASE(query, interrupt, NULL)
 	text__decode(f->cursor, &column);
 	munit_assert_string_equal(column, "n");
 
-	for (i = 0; i < 255; i++) {
+	for (i = 0; i < n_rows_buffer; i++) {
 		DECODE_ROW(1, &value);
 		munit_assert_int(value.type, ==, SQLITE_INTEGER);
 		munit_assert_int(value.integer, ==, 123);
 	}
 
 	DECODE(&f->response, rows);
-	munit_assert_ulong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
 
 	ENCODE(&interrupt, interrupt);
 	HANDLE(INTERRUPT);
 
 	ASSERT_CALLBACK(0, EMPTY);
+
+	return MUNIT_OK;
+}
+
+/* Interrupt without an active query. */
+TEST_CASE(query, interruptInactive, NULL)
+{
+	struct query_fixture *f = data;
+	struct request_interrupt interrupt;
+	(void)params;
+
+	ENCODE(&interrupt, interrupt);
+	HANDLE(INTERRUPT);
+	ASSERT_CALLBACK(0, EMPTY);
+
+	return MUNIT_OK;
+}
+
+/* Close the gateway during a large query. */
+TEST_CASE(query, largeClose, NULL)
+{
+	struct query_fixture *f = data;
+	unsigned i;
+	uint64_t stmt_id;
+	uint64_t n;
+	const char *column;
+	struct value value;
+	(void)params;
+	EXEC("BEGIN");
+
+	/* 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	/* Insert 2 response buffers worth of rows */
+	for (i = 0; i < 2 * n_rows_buffer; i++) {
+		EXEC("INSERT INTO test(n) VALUES(123)");
+	}
+	EXEC("COMMIT");
+
+	PREPARE("SELECT n FROM test");
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, query);
+	HANDLE(QUERY);
+	ASSERT_CALLBACK(0, ROWS);
+
+	uint64__decode(f->cursor, &n);
+	munit_assert_int(n, ==, 1);
+	text__decode(f->cursor, &column);
+	munit_assert_string_equal(column, "n");
+
+	for (i = 0; i < n_rows_buffer; i++) {
+		DECODE_ROW(1, &value);
+		munit_assert_int(value.type, ==, SQLITE_INTEGER);
+		munit_assert_int(value.integer, ==, 123);
+	}
+
+	DECODE(&f->response, rows);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
 
 	return MUNIT_OK;
 }
@@ -1143,6 +1506,110 @@ TEST_CASE(query, barrier, NULL)
 	HANDLE(QUERY);
 	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
+	return MUNIT_OK;
+}
+
+/* Submit a query request right after the server has been re-elected and needs
+ * to catch up with logs, but close early */
+TEST_CASE(query, barrierInFlightQuery, NULL)
+{
+	struct query_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	PREPARE("INSERT INTO test(n) VALUES(1)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Re-elect ourselves and issue a query request */
+	CLUSTER_ELECT(0);
+
+	PREPARE("SELECT n FROM test");
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, query);
+	HANDLE(QUERY);
+	return MUNIT_OK;
+}
+
+/* Submit a query sql request right after the server has been re-elected and needs
+ * to catch up with logs, but close early */
+TEST_CASE(query, barrierInFlightQuerySql, NULL)
+{
+	struct query_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	PREPARE("INSERT INTO test(n) VALUES(1)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Re-elect ourselves and issue a query request */
+	CLUSTER_ELECT(0);
+
+	QUERY_SQL_SUBMIT("SELECT n FROM test");
+	return MUNIT_OK;
+}
+
+/* Submit an exec request right after the server has been re-elected and needs
+ * to catch up with logs, but close early */
+TEST_CASE(query, barrierInFlightExec, NULL)
+{
+	struct query_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	PREPARE("INSERT INTO test(n) VALUES(1)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Re-elect ourselves and issue an exec request */
+	CLUSTER_ELECT(0);
+
+	PREPARE("INSERT INTO test(n) VALUES(2)");
+	EXEC_SUBMIT(stmt_id);
+	return MUNIT_OK;
+}
+
+/* Send a QUERY request in the new (schema version 1) format, which
+ * supports larger numbers of parameters. */
+TEST_CASE(query, manyParams, NULL)
+{
+	struct query_fixture *f = data;
+	uint64_t stmt_id;
+	size_t len = 20000;
+	char *sql = munit_malloc(len);
+	size_t pos;
+	size_t i;
+	size_t num_query_params = 999;
+	struct value *values = munit_calloc(num_query_params, sizeof(*values));
+	(void)params;
+
+	pos = snprintf(sql, len, "SELECT (n) FROM test WHERE n = ?");
+	for (i = 1; i < num_query_params; i++) {
+		pos += snprintf(sql + pos, len - pos, " OR n = ?");
+	}
+
+	for (i = 0; i < num_query_params; i++) {
+		values[i].type = SQLITE_INTEGER;
+		values[i].integer = i;
+	}
+
+	PREPARE(sql);
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, query);
+	ENCODE_PARAMS(num_query_params, values, TUPLE__PARAMS32);
+	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_QUERY, 1, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, ROWS);
+
+	FINALIZE(stmt_id);
+	free(values);
+	free(sql);
 	return MUNIT_OK;
 }
 
@@ -1180,6 +1647,7 @@ TEST_CASE(finalize, success, NULL)
 	uint64_t stmt_id;
 	struct finalize_fixture *f = data;
 	(void)params;
+	CLUSTER_ELECT(0);
 	PREPARE("CREATE TABLE test (n INT)");
 	f->request.db_id = 0;
 	f->request.stmt_id = stmt_id;
@@ -1227,8 +1695,51 @@ TEST_CASE(exec_sql, single, NULL)
 	f->request.sql = "CREATE TABLE test (n INT)";
 	ENCODE(&f->request, exec_sql);
 	HANDLE(EXEC_SQL);
-	CLUSTER_APPLIED(2);
+	CLUSTER_APPLIED(4);
 	ASSERT_CALLBACK(0, RESULT);
+	return MUNIT_OK;
+}
+
+/* Exec a SQL text with a single query. */
+TEST_CASE(exec_sql, empty1, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "";
+	ENCODE(&f->request, exec_sql);
+	HANDLE(EXEC_SQL);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+	return MUNIT_OK;
+}
+
+/* Exec a SQL text with a single query. */
+TEST_CASE(exec_sql, empty2, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = " --   Comment";
+	ENCODE(&f->request, exec_sql);
+	HANDLE(EXEC_SQL);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+	return MUNIT_OK;
+}
+
+/* Exec an invalid SQL text with a single query. */
+TEST_CASE(exec_sql, invalid, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "NOT SQL";
+	ENCODE(&f->request, exec_sql);
+	HANDLE(EXEC_SQL);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "near \"NOT\": syntax error");
 	return MUNIT_OK;
 }
 
@@ -1244,6 +1755,96 @@ TEST_CASE(exec_sql, multi, NULL)
 	HANDLE(EXEC_SQL);
 	WAIT;
 	ASSERT_CALLBACK(0, RESULT);
+	return MUNIT_OK;
+}
+
+/* Exec an ATTACH DATABASE statement -- this should fail. */
+TEST_CASE(exec_sql, attach, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "ATTACH DATABASE foo AS foo";
+	ENCODE(&f->request, exec_sql);
+	HANDLE(EXEC_SQL);
+	WAIT;
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "too many attached databases - max 0");
+	return MUNIT_OK;
+}
+
+/* Exec an SQL text and close the gateway early. */
+TEST_CASE(exec_sql, closing, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "CREATE TABLE test (n INT)";
+	ENCODE(&f->request, exec_sql);
+	HANDLE(EXEC_SQL);
+	return MUNIT_OK;
+}
+
+/* Submit an EXEC_SQL request that triggers a failed barrier operation. */
+TEST_CASE(exec_sql, barrier_error, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	/* Set up an uncommitted exec operation */
+	PREPARE("CREATE TABLE test (n INT)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Submit an EXEC_SQL request, forcing a barrier, which fails */
+	CLUSTER_ELECT(0);
+	f->request.db_id = 0;
+	f->request.sql = "INSERT INTO test VALUES(123)";
+	ENCODE(&f->request, exec_sql);
+	/* We rely on leader__barrier (called by handle_exec_sql) attempting
+	 * an allocation using raft_malloc. */
+	test_raft_heap_fault_config(0, 1);
+	test_raft_heap_fault_enable();
+	HANDLE_STATUS(DQLITE_REQUEST_EXEC_SQL, RAFT_NOMEM);
+	return MUNIT_OK;
+}
+
+/* Send an EXEC_SQL request in the new (schema version 1) format, which
+ * supports larger numbers of parameters. */
+TEST_CASE(exec_sql, manyParams, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	size_t len = 20000;
+	char *sql = munit_malloc(len);
+	size_t pos;
+	size_t i;
+	size_t num_exec_params = 999;
+	struct value *values = munit_calloc(num_exec_params, sizeof(*values));
+	(void)params;
+
+	pos = snprintf(sql, len, "DELETE FROM test WHERE n = ?");
+	for (i = 1; i < num_exec_params; i++) {
+		pos += snprintf(sql + pos, len - pos, " OR n = ?");
+	}
+
+	for (i = 0; i < num_exec_params; i++) {
+		values[i].type = SQLITE_INTEGER;
+		values[i].integer = i;
+	}
+
+	EXEC("CREATE TABLE test (n INT)");
+	f->request.db_id = 0;
+	f->request.sql = sql;
+	ENCODE(&f->request, exec_sql);
+	ENCODE_PARAMS(num_exec_params, values, TUPLE__PARAMS32);
+	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_EXEC_SQL, 1, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+
+	free(values);
+	free(sql);
 	return MUNIT_OK;
 }
 
@@ -1291,6 +1892,210 @@ TEST_CASE(query_sql, small, NULL)
 	return MUNIT_OK;
 }
 
+/* Exec an empty query sql. */
+TEST_CASE(query_sql, empty1, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	EXEC("INSERT INTO test VALUES(123)");
+	f->request.db_id = 0;
+	f->request.sql = "";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(0, "empty statement");
+	return MUNIT_OK;
+}
+
+/* Exec an empty query sql. */
+TEST_CASE(query_sql, empty2, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	EXEC("INSERT INTO test VALUES(123)");
+	f->request.db_id = 0;
+	f->request.sql = "               -- a comment";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(0, "empty statement");
+	return MUNIT_OK;
+}
+
+/* Exec an invalid query sql. */
+TEST_CASE(query_sql, invalid, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	EXEC("INSERT INTO test VALUES(123)");
+	f->request.db_id = 0;
+	f->request.sql = "NOT SQL";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "near \"NOT\": syntax error");
+	return MUNIT_OK;
+}
+
+/* Exec a SQL query whose result set needs multiple pages. */
+TEST_CASE(query_sql, large, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	unsigned i;
+	uint64_t n;
+	const char *column;
+	struct value value;
+	bool finished;
+	EXEC("BEGIN");
+
+	/* 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	/* Insert 1 less than 2 response buffers worth of rows, otherwise we need
+	 * 3 responses, of which the last one contains no rows. */
+	for (i = 0; i < ((2 * n_rows_buffer) - 1); i++) {
+		EXEC("INSERT INTO test(n) VALUES(123)");
+	}
+	EXEC("COMMIT");
+
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, ROWS);
+
+	uint64__decode(f->cursor, &n);
+	munit_assert_int(n, ==, 1);
+	text__decode(f->cursor, &column);
+	munit_assert_string_equal(column, "n");
+
+	/* First response contains max amount of rows */
+	for (i = 0; i < n_rows_buffer; i++) {
+		DECODE_ROW(1, &value);
+		munit_assert_int(value.type, ==, SQLITE_INTEGER);
+		munit_assert_int(value.integer, ==, 123);
+	}
+
+	DECODE(&f->response, rows);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
+
+	gateway__resume(f->gateway, &finished);
+	munit_assert_false(finished);
+
+	ASSERT_CALLBACK(0, ROWS);
+
+	uint64__decode(f->cursor, &n);
+	munit_assert_int(n, ==, 1);
+	text__decode(f->cursor, &column);
+	munit_assert_string_equal(column, "n");
+
+	/* Second, and last, response contains 1 less than maximum amount */
+	for (i = 0; i < n_rows_buffer - 1; i++) {
+		DECODE_ROW(1, &value);
+		munit_assert_int(value.type, ==, SQLITE_INTEGER);
+		munit_assert_int(value.integer, ==, 123);
+	}
+
+	DECODE(&f->response, rows);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_DONE);
+
+	gateway__resume(f->gateway, &finished);
+	munit_assert_true(finished);
+	return MUNIT_OK;
+}
+
+/* Exec a SQL query whose result set needs multiple pages and close before
+ * receiving the full result set. */
+TEST_CASE(query_sql, largeClose, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	unsigned i;
+	uint64_t n;
+	const char *column;
+	struct value value;
+	EXEC("BEGIN");
+
+	/* 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	/* Insert 1 less than 2 response buffers worth of rows, otherwise we need
+	 * 3 responses, of which the last one contains no rows. */
+	for (i = 0; i < ((2 * n_rows_buffer) - 1); i++) {
+		EXEC("INSERT INTO test(n) VALUES(123)");
+	}
+	EXEC("COMMIT");
+
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, ROWS);
+
+	uint64__decode(f->cursor, &n);
+	munit_assert_int(n, ==, 1);
+	text__decode(f->cursor, &column);
+	munit_assert_string_equal(column, "n");
+
+	/* First response contains max amount of rows */
+	for (i = 0; i < n_rows_buffer; i++) {
+		DECODE_ROW(1, &value);
+		munit_assert_int(value.type, ==, SQLITE_INTEGER);
+		munit_assert_int(value.integer, ==, 123);
+	}
+
+	DECODE(&f->response, rows);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
+
+	return MUNIT_OK;
+}
+
+/* Interrupt a large query sql. */
+TEST_CASE(query_sql, interrupt, NULL)
+{
+	struct query_sql_fixture *f = data;
+	struct request_interrupt interrupt;
+	unsigned i;
+	uint64_t n;
+	const char *column;
+	struct value value;
+	(void)params;
+	EXEC("BEGIN");
+
+	/* 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	/* Insert 2 response buffers worth of rows */
+	for (i = 0; i < 2 * n_rows_buffer; i++) {
+		EXEC("INSERT INTO test(n) VALUES(123)");
+	}
+	EXEC("COMMIT");
+
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, ROWS);
+
+	uint64__decode(f->cursor, &n);
+	munit_assert_int(n, ==, 1);
+	text__decode(f->cursor, &column);
+	munit_assert_string_equal(column, "n");
+
+	for (i = 0; i < n_rows_buffer; i++) {
+		DECODE_ROW(1, &value);
+		munit_assert_int(value.type, ==, SQLITE_INTEGER);
+		munit_assert_int(value.integer, ==, 123);
+	}
+
+	DECODE(&f->response, rows);
+	munit_assert_ullong(f->response.eof, ==, DQLITE_RESPONSE_ROWS_PART);
+
+	ENCODE(&interrupt, interrupt);
+	HANDLE(INTERRUPT);
+	ASSERT_CALLBACK(0, EMPTY);
+
+	return MUNIT_OK;
+}
+
 /* Perform a query with parameters */
 TEST_CASE(query_sql, params, NULL)
 {
@@ -1311,9 +2116,203 @@ TEST_CASE(query_sql, params, NULL)
 	values[0].integer = 1;
 	values[1].type = SQLITE_INTEGER;
 	values[1].integer = 4;
-	ENCODE_PARAMS(2, values);
+	ENCODE_PARAMS(2, values, TUPLE__PARAMS);
 
 	HANDLE(QUERY_SQL);
 	ASSERT_CALLBACK(0, ROWS);
+	return MUNIT_OK;
+}
+
+/* Perform a query and close the gateway early. */
+TEST_CASE(query_sql, closing, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	EXEC("INSERT INTO test VALUES(123)");
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	return MUNIT_OK;
+}
+
+/* Perform a query yielding a lot of rows and close the gateway early. */
+TEST_CASE(query_sql, manyClosing, NULL)
+{
+	(void)params;
+	struct query_sql_fixture *f = data;
+	bool finished;
+	int rv;
+
+	/* Insert more than maximum amount of rows that can fit in a single response.
+	 * 16 = 8B header + 8B value (int) */
+	unsigned n_rows_buffer = max_rows_buffer(16);
+	for (unsigned i = 0; i < n_rows_buffer + 32; i++) {
+		EXEC("INSERT INTO test VALUES(123)");
+	}
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	gateway__close(f->gateway);
+	rv = gateway__resume(f->gateway, &finished);
+	munit_assert_int(rv, ==, 0);
+	return MUNIT_OK;
+}
+
+/* Submit a QUERY_SQL request that triggers a failed barrier operation. */
+TEST_CASE(query_sql, barrier_error, NULL)
+{
+	struct query_sql_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	/* Set up an uncommitted exec operation */
+	PREPARE("INSERT INTO test VALUES(123)");
+	EXEC_SUBMIT(stmt_id);
+	CLUSTER_DEPOSE;
+	ASSERT_CALLBACK(0, FAILURE);
+
+	/* Submit a QUERY_SQL request, forcing a barrier, which fails */
+	CLUSTER_ELECT(0);
+	f->request.db_id = 0;
+	f->request.sql = "SELECT n FROM test";
+	ENCODE(&f->request, query_sql);
+	/* We rely on leader__barrier (called by handle_query_sql) attempting
+	 * an allocation using raft_malloc. */
+	test_raft_heap_fault_config(0, 1);
+	test_raft_heap_fault_enable();
+	HANDLE_STATUS(DQLITE_REQUEST_QUERY_SQL, RAFT_NOMEM);
+	return MUNIT_OK;
+}
+
+/* Send a QUERY_SQL request in the new (schema version 1) format, which
+ * supports larger numbers of parameters. */
+TEST_CASE(query_sql, manyParams, NULL)
+{
+	struct query_sql_fixture *f = data;
+	size_t len = 20000;
+	char *sql = munit_malloc(len);
+	size_t pos;
+	size_t i;
+	size_t num_query_params = 999;
+	struct value *values = munit_calloc(num_query_params, sizeof(*values));
+	(void)params;
+
+	pos = snprintf(sql, len, "SELECT (n) FROM test WHERE n = ?");
+	for (i = 1; i < num_query_params; i++) {
+		pos += snprintf(sql + pos, len - pos, " OR n = ?");
+	}
+
+	for (i = 0; i < num_query_params; i++) {
+		values[i].type = SQLITE_INTEGER;
+		values[i].integer = i;
+	}
+
+	f->request.db_id = 0;
+	f->request.sql = sql;
+	ENCODE(&f->request, query_sql);
+	ENCODE_PARAMS(num_query_params, values, TUPLE__PARAMS32);
+	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_QUERY_SQL, 1, 0);
+	WAIT;
+	ASSERT_CALLBACK(0, ROWS);
+
+	free(values);
+	free(sql);
+	return MUNIT_OK;
+}
+
+/* Send a QUERY_SQL request containing more than one statement. */
+TEST_CASE(query_sql, nonemptyTail, NULL)
+{
+	struct query_sql_fixture *f = data;
+	(void)params;
+	f->request.db_id = 0;
+	f->request.sql = "SELECT * FROM test; SELECT (n) FROM test";
+	ENCODE(&f->request, query_sql);
+	HANDLE(QUERY_SQL);
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "nonempty statement tail");
+	return MUNIT_OK;
+}
+
+/******************************************************************************
+ *
+ * cluster
+ *
+ ******************************************************************************/
+
+struct request_cluster_fixture
+{
+	FIXTURE;
+	struct request_cluster request;
+	struct response_servers response;
+};
+
+TEST_SUITE(request_cluster);
+TEST_SETUP(request_cluster)
+{
+	struct request_cluster_fixture *f = munit_malloc(sizeof *f);
+	SETUP;
+	CLUSTER_ELECT(0);
+	return f;
+}
+TEST_TEAR_DOWN(request_cluster)
+{
+	struct request_cluster_fixture *f = data;
+	TEAR_DOWN;
+	free(f);
+}
+
+/* Submit a cluster request with an invalid format version. */
+TEST_CASE(request_cluster, unrecognizedFormat, NULL)
+{
+	struct request_cluster_fixture *f = data;
+	(void)params;
+	f->request.format = 2;
+	ENCODE(&f->request, cluster);
+	HANDLE(CLUSTER);
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(DQLITE_PARSE, "unrecognized cluster format");
+	return MUNIT_OK;
+}
+
+/******************************************************************************
+ *
+ * invalid
+ *
+ ******************************************************************************/
+
+struct invalid_fixture
+{
+	FIXTURE;
+	struct request_leader request;
+	struct response_server response;
+};
+
+TEST_SUITE(invalid);
+TEST_SETUP(invalid)
+{
+	struct invalid_fixture *f = munit_malloc(sizeof *f);
+	SETUP;
+	CLUSTER_ELECT(0);
+	return f;
+}
+TEST_TEAR_DOWN(invalid)
+{
+	struct invalid_fixture *f = data;
+	TEAR_DOWN;
+	free(f);
+}
+
+/* Submit a request with an unrecognized type. */
+TEST_CASE(invalid, requestType, NULL)
+{
+	struct invalid_fixture *f = data;
+	(void)params;
+	ENCODE(&f->request, leader);
+	HANDLE_STATUS(123, 0);
+	ASSERT_CALLBACK(0, FAILURE);
+	ASSERT_FAILURE(DQLITE_PARSE, "unrecognized request type");
 	return MUNIT_OK;
 }

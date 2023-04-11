@@ -23,6 +23,7 @@
 #include "../../src/registry.h"
 #include "../../src/vfs.h"
 
+#include "../lib/fs.h"
 #include "../lib/heap.h"
 #include "../lib/logger.h"
 #include "../lib/sqlite.h"
@@ -38,6 +39,7 @@ struct server
 	struct config config;
 	sqlite3_vfs vfs;
 	struct registry registry;
+	char *dir;
 };
 
 #define FIXTURE_CLUSTER                   \
@@ -52,10 +54,11 @@ struct server
 		int _rv;                                                    \
 		SETUP_HEAP;                                                 \
 		SETUP_SQLITE;                                               \
-		_rv = raft_fixture_init(&f->cluster, N_SERVERS, f->fsms);   \
+		_rv = raft_fixture_init(&f->cluster);                       \
 		munit_assert_int(_rv, ==, 0);                               \
 		for (_i = 0; _i < N_SERVERS; _i++) {                        \
 			SETUP_SERVER(_i, VERSION);                          \
+			raft_fixture_grow(&f->cluster, &f->fsms[_i]);       \
 		}                                                           \
 		_rv = raft_fixture_configuration(&f->cluster, N_SERVERS,    \
 						 &_configuration);          \
@@ -78,12 +81,15 @@ struct server
                                                                        \
 		sprintf(address, "%d", I + 1);                         \
                                                                        \
-		_rc = config__init(&_s->config, I + 1, address);       \
+		char *dir = test_dir_setup();                          \
+		_s->dir = dir;                                         \
+                                                                       \
+		_rc = config__init(&_s->config, I + 1, address, dir);  \
 		munit_assert_int(_rc, ==, 0);                          \
                                                                        \
 		registry__init(&_s->registry, &_s->config);            \
                                                                        \
-		_rc = VfsInit(&_s->vfs, _s->config.name);            \
+		_rc = VfsInit(&_s->vfs, _s->config.name);              \
 		munit_assert_int(_rc, ==, 0);                          \
 		_rc = sqlite3_vfs_register(&_s->vfs, 0);               \
 		munit_assert_int(_rc, ==, 0);                          \
@@ -112,6 +118,7 @@ struct server
 		sqlite3_vfs_unregister(&s->vfs);     \
 		VfsClose(&s->vfs);                   \
 		config__close(&s->config);           \
+		test_dir_tear_down(s->dir);          \
 		test_logger_tear_down(&s->logger);   \
 	}
 

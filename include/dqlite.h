@@ -3,13 +3,26 @@
 
 #include <sqlite3.h>
 #include <stddef.h>
+#include <stdint.h>
+
+/**
+ * Version.
+ */
+#define DQLITE_VERSION_MAJOR    1
+#define DQLITE_VERSION_MINOR    14
+#define DQLITE_VERSION_RELEASE  0
+#define DQLITE_VERSION_NUMBER (DQLITE_VERSION_MAJOR *100*100 + DQLITE_VERSION_MINOR *100 + DQLITE_VERSION_RELEASE)
+
+int dqlite_version_number (void);
 
 /**
  * Error codes.
  */
-#define DQLITE_ERROR 1  /* Generic error */
-#define DQLITE_MISUSE 2 /* Library used incorrectly */
-#define DQLITE_NOMEM 3  /* A malloc() failed */
+enum {
+    DQLITE_ERROR = 1, /* Generic error */
+    DQLITE_MISUSE,    /* Library used incorrectly */
+    DQLITE_NOMEM      /* A malloc() failed */
+};
 
 /**
  * Dqlite node handle.
@@ -33,14 +46,17 @@ typedef unsigned long long dqlite_node_id;
  * created with a different ID. The very first node, used to bootstrap a new
  * cluster, must have ID #1. Every time a node is started again, it must be
  * passed the same ID.
- *
+
  * The @address argument is the network address that clients or other nodes in
  * the cluster must use to connect to this dqlite node. If no custom connect
  * function is going to be set using dqlite_node_set_connect_func(), then the
- * format of the string must be "<HOST>:<PORT>", where <HOST> is an IPv4/IPv6
- * address or a DNS name, and <PORT> is a port number. Otherwise if a custom
- * connect function is used, then the format of the string must by whatever the
- * custom connect function accepts.
+ * format of the string must be "<HOST>" or "<HOST>:<PORT">, where <HOST> is a
+ * numeric IPv4/IPv6 address and <PORT> is a port number. The port number
+ * defaults to 8080 if not specified. If a port number is specified with an
+ * IPv6 address, the address must be enclosed in square brackets "[]".
+ *
+ * If a custom connect function is used, then the format of the string must by
+ * whatever the custom connect function accepts.
  *
  * The @data_dir argument the file system path where the node should store its
  * durable data, such as Raft log entries containing WAL frames of the SQLite
@@ -49,6 +65,12 @@ typedef unsigned long long dqlite_node_id;
  * No reference to the memory pointed to by @address and @data_dir is kept by
  * the dqlite library, so any memory associated with them can be released after
  * the function returns.
+ *
+ * Even if an error is returned, the caller should call dqlite_node_destroy()
+ * on the dqlite_node* value pointed to by @n, and calling dqlite_node_errmsg()
+ * with that value will return a valid error string. (In some cases *n will be
+ * set to NULL, but dqlite_node_destroy() and dqlite_node_errmsg() will handle
+ * this gracefully.)
  */
 int dqlite_node_create(dqlite_node_id id,
 		       const char *address,
@@ -71,12 +93,19 @@ void dqlite_node_destroy(dqlite_node *n);
  * The given address might match the one passed to @dqlite_node_create or be a
  * different one (for example if the application wants to proxy it).
  *
- * The format of the @address argument must be either "<HOST>:<PORT>", where
- * <HOST> is an IPv4/IPv6 address or a DNS name and <PORT> is a port number, or
- * "@<PATH>", where <PATH> is an abstract Unix socket path. The special string
- * "@" can be used to automatically select an available abstract Unix socket
+ * The format of the @address argument must be one of 
+ *
+ * 1. "<HOST>"
+ * 2. "<HOST>:<PORT>"
+ * 3. "@<PATH>"
+ *
+ * Where <HOST> is a numeric IPv4/IPv6 address, <PORT> is a port number, and
+ * <PATH> is an abstract Unix socket path. The port number defaults to 8080 if
+ * not specified. In the second form, if <HOST> is an IPv6 address, it must be
+ * enclosed in square brackets "[]". In the third form, if <PATH> is empty, the
+ * implementation will automatically select an available abstract Unix socket
  * path, which can then be retrieved with dqlite_node_get_bind_address().
-
+ *
  * If an abstract Unix socket is used the dqlite node will accept only
  * connections originating from the same process.
  *
@@ -112,6 +141,7 @@ int dqlite_node_set_connect_func(dqlite_node *n,
 				 void *arg);
 
 /**
+ * DEPRECATED - USE `dqlite_node_set_network_latency_ms`
  * Set the average one-way network latency, expressed in nanoseconds.
  *
  * This value is used internally by dqlite to decide how frequently the leader
@@ -124,6 +154,21 @@ int dqlite_node_set_connect_func(dqlite_node *n,
 int dqlite_node_set_network_latency(dqlite_node *n,
 				    unsigned long long nanoseconds);
 
+
+/**
+ * Set the average one-way network latency, expressed in milliseconds.
+ *
+ * This value is used internally by dqlite to decide how frequently the leader
+ * node should send heartbeats to other nodes in order to maintain its
+ * leadership, and how long other nodes should wait before deciding that the
+ * leader has died and initiate a failover.
+ *
+ * This function must be called before calling dqlite_node_start().
+ *
+ * Latency should not be 0 or larger than 3600000 milliseconds.
+ */
+int dqlite_node_set_network_latency_ms(dqlite_node *t, unsigned milliseconds);
+
 /**
  * Set the failure domain associated with this node.
  *
@@ -131,6 +176,36 @@ int dqlite_node_set_network_latency(dqlite_node *n,
  * with the "Describe node" client request.
  */
 int dqlite_node_set_failure_domain(dqlite_node *n, unsigned long long code);
+
+/**
+ * Set the snapshot parameters for this node.
+ *
+ * This function determines how frequently a node will snapshot the state
+ * of the database and how many raft log entries will be kept around after
+ * a snapshot has been taken.
+ *
+ * `snapshot_threshold` : Determines the frequency of taking a snapshot, the
+ * lower the number, the higher the frequency.
+ *
+ * `snapshot_trailing` : Determines the amount of log entries kept around after
+ * taking a snapshot. Lowering this number decreases disk and memory footprint
+ * but increases the chance of having to send a full snapshot (instead of a
+ * number of log entries to a node that has fallen behind.
+ *
+ * This function must be called before calling dqlite_node_start().
+ */
+int dqlite_node_set_snapshot_params(dqlite_node *n, unsigned snapshot_threshold,
+                                    unsigned snapshot_trailing);
+
+/**
+ * WARNING: This is an experimental API.
+ *
+ * By default dqlite holds the SQLite database file and WAL in memory. By enabling
+ * disk-mode, dqlite will hold the SQLite database file on-disk while keeping the WAL
+ * in memory. Has to be called after `dqlite_node_create` and before
+ * `dqlite_node_start`.
+ */
+int dqlite_node_enable_disk_mode(dqlite_node *n);
 
 /**
  * Start a dqlite node.
@@ -157,7 +232,22 @@ struct dqlite_node_info
 };
 typedef struct dqlite_node_info dqlite_node_info;
 
+/* Defined to be an extensible struct, future additions to this struct should be
+ * 64-bits wide and 0 should not be used as a valid value. */
+struct dqlite_node_info_ext
+{
+        uint64_t size; /* The size of this struct */
+        uint64_t id; /* dqlite_node_id */
+        uint64_t address;
+        uint64_t dqlite_role;
+};
+typedef struct dqlite_node_info_ext dqlite_node_info_ext;
+#define DQLITE_NODE_INFO_EXT_SZ_ORIG 32U /* (4 * 64) / 8 */
+
 /**
+ * !!! Deprecated, use `dqlite_node_recover_ext` instead which also includes
+ * dqlite roles. !!!
+ *
  * Force recovering a dqlite node which is part of a cluster whose majority of
  * nodes have died, and therefore has become unavailable.
  *
@@ -184,6 +274,32 @@ typedef struct dqlite_node_info dqlite_node_info;
 int dqlite_node_recover(dqlite_node *n, dqlite_node_info infos[], int n_info);
 
 /**
+ * Force recovering a dqlite node which is part of a cluster whose majority of
+ * nodes have died, and therefore has become unavailable.
+ *
+ * In order for this operation to be safe you must follow these steps:
+ *
+ * 1. Make sure no dqlite node in the cluster is running.
+ *
+ * 2. Identify all dqlite nodes that have survived and that you want to be part
+ *    of the recovered cluster.
+ *
+ * 3. Among the survived dqlite nodes, find the one with the most up-to-date
+ *    raft term and log.
+ *
+ * 4. Invoke @dqlite_node_recover_ext exactly one time, on the node you found in
+ *    step 3, and pass it an array of #dqlite_node_info filled with the IDs,
+ *    addresses and roles of the survived nodes, including the one being recovered.
+ *
+ * 5. Copy the data directory of the node you ran @dqlite_node_recover_ext on to all
+ *    other non-dead nodes in the cluster, replacing their current data
+ *    directory.
+ *
+ * 6. Restart all nodes.
+ */
+int dqlite_node_recover_ext(dqlite_node *n, dqlite_node_info_ext infos[], int n_info);
+
+/**
  * Return a human-readable description of the last error occurred.
  */
 const char *dqlite_node_errmsg(dqlite_node *n);
@@ -198,6 +314,8 @@ dqlite_node_id dqlite_generate_node_id(const char *address);
  * implementation, which can be used for replication.
  */
 int dqlite_vfs_init(sqlite3_vfs *vfs, const char *name);
+
+int dqlite_vfs_enable_disk(sqlite3_vfs *vfs);
 
 /**
  * Release all memory used internally by a SQLite VFS object that was
@@ -262,6 +380,37 @@ int dqlite_vfs_snapshot(sqlite3_vfs *vfs,
 			size_t *n);
 
 /**
+ * A data buffer.
+ */
+struct dqlite_buffer
+{
+	void *base; /* Pointer to the buffer data. */
+	size_t len; /* Length of the buffer. */
+};
+
+/**
+ * Return a shallow snapshot of the main database file and of the WAL file.
+ * Expects a bufs array of size x + 1, where x is obtained from
+ * `dqlite_vfs_num_pages`.
+ */
+int dqlite_vfs_shallow_snapshot(sqlite3_vfs *vfs,
+				const char *filename,
+				struct dqlite_buffer bufs[],
+				unsigned n);
+
+int dqlite_vfs_snapshot_disk(sqlite3_vfs *vfs,
+				const char *filename,
+				struct dqlite_buffer bufs[],
+				unsigned n);
+
+/**
+ * Return the number of database pages (excluding WAL).
+ */
+int dqlite_vfs_num_pages(sqlite3_vfs *vfs,
+			 const char *filename,
+			 unsigned *n);
+
+/**
  * Restore a snapshot of the main database file and of the WAL file.
  */
 int dqlite_vfs_restore(sqlite3_vfs *vfs,
@@ -269,4 +418,12 @@ int dqlite_vfs_restore(sqlite3_vfs *vfs,
 		       const void *data,
 		       size_t n);
 
+/**
+ * Restore a snapshot of the main database file and of the WAL file.
+ */
+int dqlite_vfs_restore_disk(sqlite3_vfs *vfs,
+		       const char *filename,
+		       const void *data,
+		       size_t main_size,
+		       size_t wal_size);
 #endif /* DQLITE_H */

@@ -10,22 +10,37 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-18.04
           - ubuntu-20.04
+          - ubuntu-22.04
         compiler:
           - gcc
           - clang
+        tracing:
+          - LIBDQLITE_TRACE=1
+          - NOLIBDQLITE_TRACE=1
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Setup dependencies
       run: |
-          sudo add-apt-repository -y ppa:dqlite/master
           sudo apt update
-          sudo apt install -y clang lcov libsqlite3-dev liblz4-dev libuv1-dev libraft-dev
+          sudo apt install -y lcov libsqlite3-dev liblz4-dev libuv1-dev
 
-    - name: Build
+    - name: Build raft
+      env:
+        CC: ${{ matrix.compiler }}
+      run: |
+          git clone https://github.com/canonical/raft.git --depth 1
+          cd raft
+          autoreconf -i
+          ./configure --enable-debug --enable-sanitize
+          make -j4
+          sudo make install
+          sudo ldconfig
+          cd ..
+
+    - name: Build dqlite
       env:
         CC: ${{ matrix.compiler }}
       run: |
@@ -36,7 +51,9 @@ jobs:
     - name: Test
       env:
         CC: ${{ matrix.compiler }}
-      run: make CFLAGS=-O0 -j2 check || (cat ./test-suite.log && false)
+      run: |
+           export ${{ matrix.tracing }}
+           make CFLAGS=-O0 -j2 check || (cat ./test-suite.log && false)
 
     - name: Coverage
       env:
@@ -44,6 +61,6 @@ jobs:
       run: if [ "${CC}" = "gcc" ]; then make code-coverage-capture; fi
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v1
+      uses: codecov/codecov-action@v3
       with:
         verbose: true

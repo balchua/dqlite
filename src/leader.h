@@ -43,7 +43,6 @@ struct leader
 	sqlite3 *conn;           /* Underlying SQLite connection. */
 	struct raft *raft;       /* Raft instance. */
 	struct exec *exec;       /* Exec request in progress, if any. */
-	struct raft_apply apply; /* To apply checkpoint commands */
 	queue queue;             /* Prev/next leader, used by struct db. */
 	struct apply *inflight;  /* TODO: make leader__close async */
 };
@@ -65,7 +64,7 @@ struct exec
 	struct leader *leader;
 	struct barrier barrier;
 	sqlite3_stmt *stmt;
-	bool done;
+	uint64_t id;
 	int status;
 	queue queue;
 	exec_cb cb;
@@ -100,6 +99,7 @@ void leader__close(struct leader *l);
 int leader__exec(struct leader *l,
 		 struct exec *req,
 		 sqlite3_stmt *stmt,
+		 uint64_t id,
 		 exec_cb cb);
 
 /**

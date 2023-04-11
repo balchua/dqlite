@@ -9,15 +9,20 @@
 #endif
 
 #include "config.h"
+#include "id.h"
 #include "lib/assert.h"
 #include "logger.h"
 #include "registry.h"
+
+#define DQLITE_ERRMSG_BUF_SIZE 300
 
 /**
  * A single dqlite server instance.
  */
 struct dqlite_node
 {
+	bool initialized;                        /* dqlite__init succeeded */
+
 	pthread_t thread;                        /* Main run loop thread. */
 	struct config config;                    /* Config values */
 	struct sqlite3_vfs vfs;                  /* In-memory VFS */
@@ -27,13 +32,12 @@ struct dqlite_node
 	struct raft_io raft_io;                  /* libuv I/O */
 	struct raft_fsm raft_fsm;                /* dqlite FSM */
 #ifdef __APPLE__
-	dispatch_semaphore_t ready;                 /* Server is ready */
-	dispatch_semaphore_t stopped;               /* Notifiy loop stopped */
+	dispatch_semaphore_t ready;              /* Server is ready */
+	dispatch_semaphore_t stopped;            /* Notifiy loop stopped */
 #else
-	sem_t ready;                                /* Server is ready */
-	sem_t stopped;                              /* Notifiy loop stopped */
+	sem_t ready;                             /* Server is ready */
+	sem_t stopped;                           /* Notifiy loop stopped */
 #endif
-	pthread_mutex_t mutex;                   /* Access incoming queue */
 	queue queue;                             /* Incoming connections */
 	queue conns;                             /* Active connections */
 	bool running;                            /* Loop is running */
@@ -44,7 +48,8 @@ struct dqlite_node
 	struct uv_prepare_s monitor;             /* Raft state change monitor */
 	int raft_state;                          /* Previous raft state */
 	char *bind_address;                      /* Listen address */
-	char errmsg[RAFT_ERRMSG_BUF_SIZE];       /* Last error occurred */
+	char errmsg[DQLITE_ERRMSG_BUF_SIZE];     /* Last error occurred */
+	struct id_state random_state;            /* For seeding ID generation */
 };
 
 int dqlite__init(struct dqlite_node *d,

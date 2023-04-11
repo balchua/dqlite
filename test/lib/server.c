@@ -17,8 +17,7 @@ static int endpointConnect(void *data,
 	*fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	munit_assert_int(*fd, !=, -1);
 	rv = connect(*fd, (struct sockaddr *)&addr, sizeof(sa_family_t) + strlen(address + 1) + 1);
-	munit_assert_int(rv, ==, 0);
-	return 0;
+	return rv;
 }
 
 void test_server_setup(struct test_server *s,
@@ -35,23 +34,24 @@ void test_server_setup(struct test_server *s,
 	memset(s->others, 0, sizeof s->others);
 }
 
-void test_server_tear_down(struct test_server *s)
+void test_server_stop(struct test_server *s)
 {
 	int rv;
 
-	clientClose(&s->client);
-	close(s->client.fd);
+	test_server_client_close(s, &s->client);
 	rv = dqlite_node_stop(s->dqlite);
 	munit_assert_int(rv, ==, 0);
-
 	dqlite_node_destroy(s->dqlite);
+}
 
+void test_server_tear_down(struct test_server *s)
+{
+	test_server_stop(s);
 	test_dir_tear_down(s->dir);
 }
 
-void test_server_start(struct test_server *s)
+void test_server_start(struct test_server *s, const MunitParameter params[])
 {
-	int client;
 	int rv;
 
 	rv = dqlite_node_create(s->id, s->address, s->dir, &s->dqlite);
@@ -63,20 +63,59 @@ void test_server_start(struct test_server *s)
 	rv = dqlite_node_set_connect_func(s->dqlite, endpointConnect, s);
 	munit_assert_int(rv, ==, 0);
 
+	rv = dqlite_node_set_network_latency_ms(s->dqlite, 10);
+	munit_assert_int(rv, ==, 0);
+
+	const char *snapshot_threshold_param = munit_parameters_get(params,
+							    SNAPSHOT_THRESHOLD_PARAM);
+	if (snapshot_threshold_param != NULL) {
+		unsigned threshold = (unsigned)atoi(snapshot_threshold_param);
+		rv = dqlite_node_set_snapshot_params(s->dqlite, threshold, threshold);
+		munit_assert_int(rv, ==, 0);
+	}
+
+	const char *disk_mode_param = munit_parameters_get(params, "disk_mode");
+	if (disk_mode_param != NULL) {
+		bool disk_mode = (bool)atoi(disk_mode_param);
+		if (disk_mode) {
+			rv = dqlite_node_enable_disk_mode(s->dqlite);
+			munit_assert_int(rv, ==, 0);
+		}
+	}
+
 	rv = dqlite_node_start(s->dqlite);
 	munit_assert_int(rv, ==, 0);
 
-	/* Connect a client. */
-	rv = endpointConnect(NULL, s->address, &client);
+	test_server_client_connect(s, &s->client);
+}
+
+struct client_proto *test_server_client(struct test_server *s)
+{
+	return &s->client;
+}
+
+void test_server_client_reconnect(struct test_server *s, struct client_proto *c)
+{
+	test_server_client_close(s, c);
+	test_server_client_connect(s, c);
+}
+
+void test_server_client_connect(struct test_server *s, struct client_proto *c)
+{
+	int rv;
+	int fd;
+
+	rv = endpointConnect(NULL, s->address, &fd);
 	munit_assert_int(rv, ==, 0);
 
-	rv = clientInit(&s->client, client);
+	rv = clientInit(c, fd);
 	munit_assert_int(rv, ==, 0);
 }
 
-struct client *test_server_client(struct test_server *s)
+void test_server_client_close(struct test_server *s, struct client_proto *c)
 {
-	return &s->client;
+	(void) s;
+	clientClose(c);
 }
 
 static void setOther(struct test_server *s, struct test_server *other)
