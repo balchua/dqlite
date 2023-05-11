@@ -7,15 +7,16 @@
 
 #include "../lib/assert.h"
 
-#include "protocol.h"
 #include "../message.h"
 #include "../protocol.h"
 #include "../request.h"
 #include "../response.h"
 #include "../tracing.h"
 #include "../tuple.h"
+#include "protocol.h"
 
-static void oom(void) {
+static void oom(void)
+{
 	abort();
 }
 
@@ -37,33 +38,34 @@ static void *callocChecked(size_t count, size_t n)
 	return p;
 }
 
-/* Convert a value that potentially borrows data from the client_proto read buffer
- * into one that owns its data. The owned data must be free with freeOwnedValue. */
+static char *strdupChecked(const char *s)
+{
+	char *p = strdup(s);
+	if (p == NULL) {
+		oom();
+	}
+	return p;
+}
+
+/* Convert a value that potentially borrows data from the client_proto read
+ * buffer into one that owns its data. The owned data must be free with
+ * freeOwnedValue. */
 static void makeValueOwned(struct value *val)
 {
 	char *p;
 	switch (val->type) {
 		case SQLITE_TEXT:
-			p = strdup(val->text);
-			if (p == NULL) {
-				oom();
-			}
-			val->text = p;
+			val->text = strdupChecked(val->text);
 			break;
 		case DQLITE_ISO8601:
-			p = strdup(val->iso8601);
-			if (p == NULL) {
-				oom();
-			}
-			val->iso8601 = p;
+			val->iso8601 = strdupChecked(val->iso8601);
 			break;
 		case SQLITE_BLOB:
 			p = mallocChecked(val->blob.len);
 			memcpy(p, val->blob.base, val->blob.len);
 			val->blob.base = p;
 			break;
-		default:
-			;
+		default:;
 	}
 }
 
@@ -83,8 +85,7 @@ static void freeOwnedValue(struct value val)
 		case SQLITE_BLOB:
 			free(val.blob.base);
 			break;
-		default:
-			;
+		default:;
 	}
 }
 
@@ -107,7 +108,10 @@ static int peekUint64(struct cursor cursor, uint64_t *val)
  * On error, -1 is returned. Otherwise the return value is the count
  * of bytes read. This may be less than n if either EOF happened or
  * the deadline kicked in. */
-static ssize_t doRead(int fd, void *buf, size_t buf_len, struct client_context *context)
+static ssize_t doRead(int fd,
+		      void *buf,
+		      size_t buf_len,
+		      struct client_context *context)
 {
 	ssize_t total;
 	struct pollfd pfd;
@@ -125,15 +129,18 @@ static ssize_t doRead(int fd, void *buf, size_t buf_len, struct client_context *
 		rv = clock_gettime(CLOCK_REALTIME, &now);
 		assert(rv == 0);
 		if (context != NULL) {
-			millis = (context->deadline.tv_sec - now.tv_sec) * 1000
-				+ (context->deadline.tv_nsec - now.tv_nsec) / 1000000;
+			millis =
+			    (context->deadline.tv_sec - now.tv_sec) * 1000 +
+			    (context->deadline.tv_nsec - now.tv_nsec) / 1000000;
 			if (millis < 0) {
-				/* poll(2) will block indefinitely if the timeout argument is
-				 * negative, and we don't want that here. Signal a timeout. */
+				/* poll(2) will block indefinitely if the
+				 * timeout argument is negative, and we don't
+				 * want that here. Signal a timeout. */
 				break;
 			}
 		} else {
-			/* The caller has explicitly asked us to block indefinitely. */
+			/* The caller has explicitly asked us to block
+			 * indefinitely. */
 			millis = -1;
 		}
 		rv = poll(&pfd, 1, (millis > INT_MAX) ? INT_MAX : (int)millis);
@@ -149,11 +156,13 @@ static ssize_t doRead(int fd, void *buf, size_t buf_len, struct client_context *
 		}
 		assert(rv == 1);
 		if (pfd.revents != POLLIN) {
-			/* If some other bits are set in the out parameter, an error occurred. */
+			/* If some other bits are set in the out parameter, an
+			 * error occurred. */
 			return -1;
 		}
 
-		n = read(fd, (char *)buf + (size_t)total, buf_len - (size_t)total);
+		n = read(fd, (char *)buf + (size_t)total,
+			 buf_len - (size_t)total);
 		if (n < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -179,7 +188,10 @@ static ssize_t doRead(int fd, void *buf, size_t buf_len, struct client_context *
  * On error, -1 is returned. Otherwise the return value is the count
  * of bytes written. This may be less than n if either EOF happened or
  * the deadline kicked in. */
-static ssize_t doWrite(int fd, void *buf, size_t buf_len, struct client_context *context)
+static ssize_t doWrite(int fd,
+		       void *buf,
+		       size_t buf_len,
+		       struct client_context *context)
 {
 	ssize_t total;
 	struct pollfd pfd;
@@ -197,15 +209,18 @@ static ssize_t doWrite(int fd, void *buf, size_t buf_len, struct client_context 
 		rv = clock_gettime(CLOCK_REALTIME, &now);
 		assert(rv == 0);
 		if (context != NULL) {
-			millis = (context->deadline.tv_sec - now.tv_sec) * 1000
-				+ (context->deadline.tv_nsec - now.tv_nsec) / 1000000;
+			millis =
+			    (context->deadline.tv_sec - now.tv_sec) * 1000 +
+			    (context->deadline.tv_nsec - now.tv_nsec) / 1000000;
 			if (millis < 0) {
-				/* poll(2) will block indefinitely if the timeout argument is
-				 * negative, and we don't want that here. Signal a timeout. */
+				/* poll(2) will block indefinitely if the
+				 * timeout argument is negative, and we don't
+				 * want that here. Signal a timeout. */
 				break;
 			}
 		} else {
-			/* The caller has explicitly asked us to block indefinitely. */
+			/* The caller has explicitly asked us to block
+			 * indefinitely. */
 			millis = -1;
 		}
 		rv = poll(&pfd, 1, (millis > INT_MAX) ? INT_MAX : (int)millis);
@@ -221,12 +236,13 @@ static ssize_t doWrite(int fd, void *buf, size_t buf_len, struct client_context 
 		}
 		assert(rv == 1);
 		if (pfd.revents != POLLOUT) {
-			/* If some other bits are set in the out parameter, an error
-			 * occurred. */
+			/* If some other bits are set in the out parameter, an
+			 * error occurred. */
 			return -1;
 		}
 
-		n = write(fd, (char *)buf + (size_t)total, buf_len - (size_t)total);
+		n = write(fd, (char *)buf + (size_t)total,
+			  buf_len - (size_t)total);
 		if (n < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -259,10 +275,7 @@ static int handleFailure(struct client_proto *c)
 	if (c->errmsg != NULL) {
 		free(c->errmsg);
 	}
-	c->errmsg = strdup(failure.message);
-	if (c->errmsg == NULL) {
-		oom();
-	}
+	c->errmsg = strdupChecked(failure.message);
 	return DQLITE_CLIENT_PROTO_RECEIVED_FAILURE;
 }
 
@@ -278,13 +291,16 @@ void clientContextMillis(struct client_context *context, long millis)
 	}
 }
 
-int clientInit(struct client_proto *c, int fd)
+/* TODO accept a context here? */
+int clientOpen(struct client_proto *c, const char *addr, uint64_t server_id)
 {
-	tracef("init client");
 	int rv;
-	c->fd = fd;
-	c->db_name = NULL;
-	c->db_is_init = false;
+
+	c->server_id = server_id;
+	rv = c->connect(c->connect_arg, addr, &c->fd);
+	if (rv != 0) {
+		return DQLITE_CLIENT_PROTO_ERROR;
+	}
 
 	rv = buffer__init(&c->read);
 	if (rv != 0) {
@@ -330,7 +346,10 @@ int clientSendHandshake(struct client_proto *c, struct client_context *context)
 	return 0;
 }
 
-static int writeMessage(struct client_proto *c, uint8_t type, uint8_t schema, struct client_context *context)
+static int writeMessage(struct client_proto *c,
+			uint8_t type,
+			uint8_t schema,
+			struct client_context *context)
 {
 	struct message message = {0};
 	size_t n;
@@ -373,17 +392,20 @@ static int writeMessage(struct client_proto *c, uint8_t type, uint8_t schema, st
 	}
 
 /* Write out a request. */
-#define REQUEST(LOWER, UPPER, SCHEMA)                                                 \
-	{                                                                             \
-		int _rv;                                                              \
-		BUFFER_REQUEST(LOWER, UPPER);                                         \
-		_rv = writeMessage(c, DQLITE_REQUEST_##UPPER, SCHEMA, context); \
-		if (_rv != 0) {                                                       \
-			return _rv;                                                   \
-		}                                                                     \
+#define REQUEST(LOWER, UPPER, SCHEMA)                                         \
+	{                                                                     \
+		int _rv;                                                      \
+		BUFFER_REQUEST(LOWER, UPPER);                                 \
+		_rv =                                                         \
+		    writeMessage(c, DQLITE_REQUEST_##UPPER, SCHEMA, context); \
+		if (_rv != 0) {                                               \
+			return _rv;                                           \
+		}                                                             \
 	}
 
-static int readMessage(struct client_proto *c, uint8_t *type, struct client_context *context)
+static int readMessage(struct client_proto *c,
+		       uint8_t *type,
+		       struct client_context *context)
 {
 	struct message message = {0};
 	struct cursor cursor;
@@ -438,8 +460,10 @@ static int readMessage(struct client_proto *c, uint8_t *type, struct client_cont
 		if (_rv != 0) {                                       \
 			return _rv;                                   \
 		}                                                     \
-		if (_type == DQLITE_RESPONSE_FAILURE) {               \
-			handleFailure(c);                             \
+		if (_type == DQLITE_RESPONSE_FAILURE &&               \
+		    _type != DQLITE_RESPONSE_##UPPER) {               \
+			_rv = handleFailure(c);                       \
+			return _rv;                                   \
 		} else if (_type != DQLITE_RESPONSE_##UPPER) {        \
 			return DQLITE_CLIENT_PROTO_ERROR;             \
 		}                                                     \
@@ -459,7 +483,9 @@ int clientSendLeader(struct client_proto *c, struct client_context *context)
 	return 0;
 }
 
-int clientSendClient(struct client_proto *c, uint64_t id, struct client_context *context)
+int clientSendClient(struct client_proto *c,
+		     uint64_t id,
+		     struct client_context *context)
 {
 	tracef("client send client");
 	struct request_client request;
@@ -468,16 +494,15 @@ int clientSendClient(struct client_proto *c, uint64_t id, struct client_context 
 	return 0;
 }
 
-int clientSendOpen(struct client_proto *c, const char *name, struct client_context *context)
+int clientSendOpen(struct client_proto *c,
+		   const char *name,
+		   struct client_context *context)
 {
 	tracef("client send open name %s", name);
 	struct request_open request;
-	c->db_name = strdup(name);
-	if (c->db_name == NULL) {
-		oom();
-	}
+	c->db_name = strdupChecked(name);
 	request.filename = name;
-	request.flags = 0; /* unused */
+	request.flags = 0;    /* unused */
 	request.vfs = "test"; /* unused */
 	REQUEST(open, OPEN, 0);
 	return 0;
@@ -494,7 +519,9 @@ int clientRecvDb(struct client_proto *c, struct client_context *context)
 	return 0;
 }
 
-int clientSendPrepare(struct client_proto *c, const char *sql, struct client_context *context)
+int clientSendPrepare(struct client_proto *c,
+		      const char *sql,
+		      struct client_context *context)
 {
 	tracef("client send prepare");
 	struct request_prepare request;
@@ -505,16 +532,19 @@ int clientSendPrepare(struct client_proto *c, const char *sql, struct client_con
 }
 
 int clientRecvStmt(struct client_proto *c,
-			uint32_t *stmt_id,
-			uint64_t *offset,
-			struct client_context *context)
+		   uint32_t *stmt_id,
+		   uint64_t *n_params,
+		   uint64_t *offset,
+		   struct client_context *context)
 {
 	struct cursor cursor;
 	struct response_stmt_with_offset response;
 	RESPONSE(stmt_with_offset, STMT_WITH_OFFSET);
-	tracef("client recv stmt stmt_id:%" PRIu32 " offset:%" PRIu64, response.id, response.offset);
 	if (stmt_id != NULL) {
 		*stmt_id = response.id;
+	}
+	if (n_params != NULL) {
+		*n_params = response.params;
 	}
 	if (offset != NULL) {
 		*offset = response.offset;
@@ -524,7 +554,7 @@ int clientRecvStmt(struct client_proto *c,
 
 static int bufferParams(struct client_proto *c,
 			struct value *params,
-			size_t n_params)
+			unsigned n_params)
 {
 	struct tuple_encoder tup;
 	size_t i;
@@ -547,10 +577,10 @@ static int bufferParams(struct client_proto *c,
 }
 
 int clientSendExec(struct client_proto *c,
-			uint32_t stmt_id,
-			struct value *params,
-			size_t n_params,
-			struct client_context *context)
+		   uint32_t stmt_id,
+		   struct value *params,
+		   unsigned n_params,
+		   struct client_context *context)
 {
 	tracef("client send exec id %" PRIu32, stmt_id);
 	struct request_exec request;
@@ -569,10 +599,10 @@ int clientSendExec(struct client_proto *c,
 }
 
 int clientSendExecSQL(struct client_proto *c,
-			const char *sql,
-			struct value *params,
-			size_t n_params,
-			struct client_context *context)
+		      const char *sql,
+		      struct value *params,
+		      unsigned n_params,
+		      struct client_context *context)
 {
 	tracef("client send exec sql");
 	struct request_exec_sql request;
@@ -591,25 +621,27 @@ int clientSendExecSQL(struct client_proto *c,
 }
 
 int clientRecvResult(struct client_proto *c,
-			uint64_t *last_insert_id,
-			uint64_t *rows_affected,
-			struct client_context *context)
+		     uint64_t *last_insert_id,
+		     uint64_t *rows_affected,
+		     struct client_context *context)
 {
 	struct cursor cursor;
 	struct response_result response;
 	RESPONSE(result, RESULT);
-	*last_insert_id = response.last_insert_id;
-	*rows_affected = response.rows_affected;
-	tracef("client recv result last_insert_id %" PRIu64 "rows_affected %" PRIu64,
-			*last_insert_id, *rows_affected);
+	if (last_insert_id != NULL) {
+		*last_insert_id = response.last_insert_id;
+	}
+	if (rows_affected != NULL) {
+		*rows_affected = response.rows_affected;
+	}
 	return 0;
 }
 
 int clientSendQuery(struct client_proto *c,
-			uint32_t stmt_id,
-			struct value *params,
-			size_t n_params,
-			struct client_context *context)
+		    uint32_t stmt_id,
+		    struct value *params,
+		    unsigned n_params,
+		    struct client_context *context)
 {
 	tracef("client send query stmt_id %" PRIu32, stmt_id);
 	struct request_query request;
@@ -628,10 +660,10 @@ int clientSendQuery(struct client_proto *c,
 }
 
 int clientSendQuerySQL(struct client_proto *c,
-			const char *sql,
-			struct value *params,
-			size_t n_params,
-			struct client_context *context)
+		       const char *sql,
+		       struct value *params,
+		       unsigned n_params,
+		       struct client_context *context)
 {
 	tracef("client send query sql sql %s", sql);
 	struct request_query_sql request;
@@ -649,7 +681,10 @@ int clientSendQuerySQL(struct client_proto *c,
 	return rv;
 }
 
-int clientRecvRows(struct client_proto *c, struct rows *rows, struct client_context *context)
+int clientRecvRows(struct client_proto *c,
+		   struct rows *rows,
+		   bool *done,
+		   struct client_context *context)
 {
 	tracef("client recv rows");
 	struct cursor cursor;
@@ -684,17 +719,15 @@ int clientRecvRows(struct client_proto *c, struct rows *rows, struct client_cont
 	rows->column_count = (unsigned)column_count;
 	assert((uint64_t)rows->column_count == column_count);
 
-	rows->column_names = callocChecked(rows->column_count, sizeof *rows->column_names);
+	rows->column_names =
+	    callocChecked(rows->column_count, sizeof *rows->column_names);
 	for (i = 0; i < rows->column_count; ++i) {
 		rv = text__decode(&cursor, &raw);
 		if (rv != 0) {
 			rv = DQLITE_CLIENT_PROTO_ERROR;
 			goto err_after_alloc_column_names;
 		}
-		rows->column_names[i] = strdup(raw);
-		if (rows->column_names[i] == NULL) {
-			oom();
-		}
+		rows->column_names[i] = strdupChecked(raw);
 	}
 
 	rows->next = NULL;
@@ -710,13 +743,15 @@ int clientRecvRows(struct client_proto *c, struct rows *rows, struct client_cont
 		}
 
 		row = mallocChecked(sizeof *row);
-		row->values = callocChecked(rows->column_count, sizeof *row->values);
+		row->values =
+		    callocChecked(rows->column_count, sizeof *row->values);
 		row->next = NULL;
 
 		/* Make sure that `goto err_after_alloc_row_values` will do the
 		 * right thing even before we enter the for loop. */
 		i = 0;
-		rv = tuple_decoder__init(&tup, rows->column_count, TUPLE__ROW, &cursor);
+		rv = tuple_decoder__init(&tup, rows->column_count, TUPLE__ROW,
+					 &cursor);
 		if (rv != 0) {
 			rv = DQLITE_CLIENT_PROTO_ERROR;
 			goto err_after_alloc_row_values;
@@ -738,6 +773,11 @@ int clientRecvRows(struct client_proto *c, struct rows *rows, struct client_cont
 		last = row;
 	}
 
+	assert(eof == DQLITE_RESPONSE_ROWS_DONE ||
+	       eof == DQLITE_RESPONSE_ROWS_PART);
+	if (done != NULL) {
+		*done = eof == DQLITE_RESPONSE_ROWS_DONE;
+	}
 	return 0;
 
 err_after_alloc_row_values:
@@ -789,7 +829,9 @@ int clientSendInterrupt(struct client_proto *c, struct client_context *context)
 	return 0;
 }
 
-int clientSendFinalize(struct client_proto *c, uint32_t stmt_id, struct client_context *context)
+int clientSendFinalize(struct client_proto *c,
+		       uint32_t stmt_id,
+		       struct client_context *context)
 {
 	tracef("client send finalize %u", stmt_id);
 	struct request_finalize request;
@@ -799,7 +841,10 @@ int clientSendFinalize(struct client_proto *c, uint32_t stmt_id, struct client_c
 	return 0;
 }
 
-int clientSendAdd(struct client_proto *c, uint64_t id, const char *address, struct client_context *context)
+int clientSendAdd(struct client_proto *c,
+		  uint64_t id,
+		  const char *address,
+		  struct client_context *context)
 {
 	tracef("client send add id %" PRIu64 " address %s", id, address);
 	struct request_add request;
@@ -809,10 +854,14 @@ int clientSendAdd(struct client_proto *c, uint64_t id, const char *address, stru
 	return 0;
 }
 
-int clientSendAssign(struct client_proto *c, uint64_t id, int role, struct client_context *context)
+int clientSendAssign(struct client_proto *c,
+		     uint64_t id,
+		     int role,
+		     struct client_context *context)
 {
 	tracef("client send assign id %" PRIu64 " role %d", id, role);
-	assert(role == DQLITE_VOTER || role == DQLITE_STANDBY || role == DQLITE_SPARE);
+	assert(role == DQLITE_VOTER || role == DQLITE_STANDBY ||
+	       role == DQLITE_SPARE);
 	struct request_assign request;
 	request.id = id;
 	request.role = (uint64_t)role;
@@ -820,7 +869,9 @@ int clientSendAssign(struct client_proto *c, uint64_t id, int role, struct clien
 	return 0;
 }
 
-int clientSendRemove(struct client_proto *c, uint64_t id, struct client_context *context)
+int clientSendRemove(struct client_proto *c,
+		     uint64_t id,
+		     struct client_context *context)
 {
 	tracef("client send remove id %" PRIu64, id);
 	struct request_remove request;
@@ -849,7 +900,9 @@ int clientSendCluster(struct client_proto *c, struct client_context *context)
 	return 0;
 }
 
-int clientSendTransfer(struct client_proto *c, uint64_t id, struct client_context *context)
+int clientSendTransfer(struct client_proto *c,
+		       uint64_t id,
+		       struct client_context *context)
 {
 	tracef("client send transfer id %" PRIu64, id);
 	struct request_transfer request;
@@ -867,7 +920,9 @@ int clientSendDescribe(struct client_proto *c, struct client_context *context)
 	return 0;
 }
 
-int clientSendWeight(struct client_proto *c, uint64_t weight, struct client_context *context)
+int clientSendWeight(struct client_proto *c,
+		     uint64_t weight,
+		     struct client_context *context)
 {
 	tracef("client send weight %" PRIu64, weight);
 	struct request_weight request;
@@ -877,9 +932,9 @@ int clientSendWeight(struct client_proto *c, uint64_t weight, struct client_cont
 }
 
 int clientRecvServer(struct client_proto *c,
-			uint64_t *id,
-			char **address,
-			struct client_context *context)
+		     uint64_t *id,
+		     char **address,
+		     struct client_context *context)
 {
 	tracef("client recv server");
 	struct cursor cursor;
@@ -887,10 +942,7 @@ int clientRecvServer(struct client_proto *c,
 	*id = 0;
 	*address = NULL;
 	RESPONSE(server, SERVER);
-	*address = strdup(response.address);
-	if (*address == NULL) {
-		oom();
-	}
+	*address = strdupChecked(response.address);
 	*id = response.id;
 	return 0;
 }
@@ -914,23 +966,23 @@ int clientRecvEmpty(struct client_proto *c, struct client_context *context)
 }
 
 int clientRecvFailure(struct client_proto *c,
-			uint64_t *code,
-			const char **msg,
-			struct client_context *context)
+		      uint64_t *code,
+		      char **msg,
+		      struct client_context *context)
 {
 	tracef("client recv failure");
 	struct cursor cursor;
 	struct response_failure response;
 	RESPONSE(failure, FAILURE);
 	*code = response.code;
-	*msg = response.message;
+	*msg = strdupChecked(response.message);
 	return 0;
 }
 
 int clientRecvServers(struct client_proto *c,
-			struct client_node_info **servers,
-			size_t *n_servers,
-			struct client_context *context)
+		      struct client_node_info **servers,
+		      uint64_t *n_servers,
+		      struct client_context *context)
 {
 	tracef("client recv servers");
 	struct cursor cursor;
@@ -959,10 +1011,7 @@ int clientRecvServers(struct client_proto *c,
 		if (rv != 0) {
 			goto err_after_alloc_srvs;
 		}
-		srvs[i].addr = strdup(raw_addr);
-		if (srvs[i].addr == NULL) {
-			oom();
-		}
+		srvs[i].addr = strdupChecked(raw_addr);
 		rv = uint64__decode(&cursor, &raw_role);
 		if (rv != 0) {
 			free(srvs[i].addr);
@@ -984,9 +1033,9 @@ err_after_alloc_srvs:
 }
 
 int clientRecvFiles(struct client_proto *c,
-			struct client_file **files,
-			size_t *n_files,
-			struct client_context *context)
+		    struct client_file **files,
+		    size_t *n_files,
+		    struct client_context *context)
 {
 	tracef("client recv files");
 	struct cursor cursor;
@@ -1010,10 +1059,7 @@ int clientRecvFiles(struct client_proto *c,
 		if (rv != 0) {
 			goto err_after_alloc_fs;
 		}
-		fs[i].name = strdup(raw_name);
-		if (fs[i].name == NULL) {
-			oom();
-		}
+		fs[i].name = strdupChecked(raw_name);
 		rv = uint64__decode(&cursor, &fs[i].size);
 		if (rv != 0) {
 			free(fs[i].name);
@@ -1044,9 +1090,9 @@ err_after_alloc_fs:
 }
 
 int clientRecvMetadata(struct client_proto *c,
-			uint64_t *failure_domain,
-			uint64_t *weight,
-			struct client_context *context)
+		       uint64_t *failure_domain,
+		       uint64_t *weight,
+		       struct client_context *context)
 {
 	tracef("client recv metadata");
 	struct cursor cursor;

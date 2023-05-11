@@ -33,14 +33,14 @@ static void connCloseCb(struct conn *conn)
 	*closed = true;
 }
 
-#define FIXTURE              \
-	FIXTURE_LOGGER;      \
-	FIXTURE_VFS;         \
-	FIXTURE_CONFIG;      \
-	FIXTURE_REGISTRY;    \
-	FIXTURE_RAFT;        \
-	FIXTURE_CLIENT;      \
-	struct conn conn;    \
+#define FIXTURE           \
+	FIXTURE_LOGGER;   \
+	FIXTURE_VFS;      \
+	FIXTURE_CONFIG;   \
+	FIXTURE_REGISTRY; \
+	FIXTURE_RAFT;     \
+	FIXTURE_CLIENT;   \
+	struct conn conn; \
 	bool closed;
 
 #define SETUP                                                          \
@@ -62,8 +62,8 @@ static void connCloseCb(struct conn *conn)
 	f->closed = false;                                             \
 	f->conn.queue[0] = &f->closed;                                 \
 	rv = conn__start(&f->conn, &f->config, &f->loop, &f->registry, \
-			 &f->raft, stream, &f->raft_transport,         \
-			 seed, connCloseCb);                           \
+			 &f->raft, stream, &f->raft_transport, seed,   \
+			 connCloseCb);                                 \
 	munit_assert_int(rv, ==, 0)
 
 #define TEAR_DOWN                         \
@@ -107,14 +107,14 @@ static void connCloseCb(struct conn *conn)
 	}
 
 /* Prepare a statement. */
-#define PREPARE_CONN(SQL, STMT_ID)                                     \
-	{                                                              \
-		int rv2;                                               \
-		rv2 = clientSendPrepare(&f->client, SQL, NULL);        \
-		munit_assert_int(rv2, ==, 0);                          \
-		test_uv_run(&f->loop, 1);                              \
-		rv2 = clientRecvStmt(&f->client, STMT_ID, NULL, NULL); \
-		munit_assert_int(rv2, ==, 0);                          \
+#define PREPARE_CONN(SQL, STMT_ID)                                           \
+	{                                                                    \
+		int rv2;                                                     \
+		rv2 = clientSendPrepare(&f->client, SQL, NULL);              \
+		munit_assert_int(rv2, ==, 0);                                \
+		test_uv_run(&f->loop, 1);                                    \
+		rv2 = clientRecvStmt(&f->client, STMT_ID, NULL, NULL, NULL); \
+		munit_assert_int(rv2, ==, 0);                                \
 	}
 
 /* Execute a statement. */
@@ -148,7 +148,7 @@ static void connCloseCb(struct conn *conn)
 		rv2 = clientSendQuery(&f->client, STMT_ID, NULL, 0, NULL); \
 		munit_assert_int(rv2, ==, 0);                              \
 		test_uv_run(&f->loop, 2);                                  \
-		rv2 = clientRecvRows(&f->client, ROWS, NULL);              \
+		rv2 = clientRecvRows(&f->client, ROWS, NULL, NULL);        \
 		munit_assert_int(rv2, ==, 0);                              \
 	}
 
@@ -343,8 +343,10 @@ TEST_CASE(exec, close_while_in_flight, NULL)
 	int rv;
 	(void)params;
 
-	EXEC_SQL_CONN("CREATE TABLE test (n)", &last_insert_id, &rows_affected, 9);
-	rv = clientSendExecSQL(&f->client, "INSERT INTO test(n) VALUES(1)", NULL, 0, NULL);
+	EXEC_SQL_CONN("CREATE TABLE test (n)", &last_insert_id, &rows_affected,
+		      9);
+	rv = clientSendExecSQL(&f->client, "INSERT INTO test(n) VALUES(1)",
+			       NULL, 0, NULL);
 	munit_assert_int(rv, ==, 0);
 
 	test_uv_run(&f->loop, 1);

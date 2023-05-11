@@ -8,6 +8,12 @@
 
 #include "format.h"
 
+/* tinycc doesn't have this builtin, nor the warning that it's meant to silence.
+ */
+#ifdef __TINYC__
+#define __builtin_assume_aligned(x, y) x
+#endif
+
 /* WAL magic value. Either this value, or the same value with the least
  * significant bit also set (FORMAT__WAL_MAGIC | 0x00000001) is stored in 32-bit
  * big-endian format in the first 4 bytes of a WAL file.
@@ -57,12 +63,15 @@ static void formatWalChecksumBytes(
 	uint32_t s1, s2;
 	/* `data` is an alias for the `hdr` member of a `struct vfsWal`. `hdr`
 	 * is the first member of this struct. Because `struct vfsWal` contains
-	 * pointer members, the struct itself will have the alignment of the pointer
-	 * members. As `hdr` is the first member, it will have this alignment too.
-	 * Therefore it is safe to assume pointer alignment (and silence the compiler).
-	 * more info -> http://www.catb.org/esr/structure-packing/ */
-	uint32_t *cur = (uint32_t *) __builtin_assume_aligned(data, sizeof(void*));
-	uint32_t *end = (uint32_t *) __builtin_assume_aligned(&data[n], sizeof(void*));
+	 * pointer members, the struct itself will have the alignment of the
+	 * pointer members. As `hdr` is the first member, it will have this
+	 * alignment too. Therefore it is safe to assume pointer alignment (and
+	 * silence the compiler). more info ->
+	 * http://www.catb.org/esr/structure-packing/ */
+	uint32_t *cur =
+	    (uint32_t *)__builtin_assume_aligned(data, sizeof(void *));
+	uint32_t *end =
+	    (uint32_t *)__builtin_assume_aligned(&data[n], sizeof(void *));
 
 	if (in) {
 		s1 = in[0];
@@ -95,7 +104,8 @@ static void formatWalChecksumBytes(
 	out[1] = s2;
 }
 
-void formatWalRestartHeader(uint8_t *header) {
+void formatWalRestartHeader(uint8_t *header)
+{
 	uint32_t checksum[2] = {0, 0};
 	uint32_t checkpoint;
 	uint32_t salt1;

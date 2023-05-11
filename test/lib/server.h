@@ -17,10 +17,11 @@
 
 struct test_server
 {
-	unsigned id;                   /* Server ID. */
-	char address[8];               /* Server address. */
-	char *dir;                     /* Data directory. */
-	dqlite_node *dqlite;           /* Dqlite instance. */
+	unsigned id;         /* Server ID. */
+	char address[8];     /* Server address. */
+	char *dir;           /* Data directory. */
+	dqlite_node *dqlite; /* Dqlite instance. */
+	bool role_management;
 	struct client_proto client;    /* Connected client. */
 	struct test_server *others[5]; /* Other servers, by ID-1. */
 };
@@ -46,7 +47,8 @@ void test_server_network(struct test_server *servers, unsigned n_servers);
 struct client_proto *test_server_client(struct test_server *s);
 
 /* Closes and reopens a client connection to the server. */
-void test_server_client_reconnect(struct test_server *s, struct client_proto *c);
+void test_server_client_reconnect(struct test_server *s,
+				  struct client_proto *c);
 
 /* Opens a client connection to the server. */
 void test_server_client_connect(struct test_server *s, struct client_proto *c);

@@ -1,17 +1,19 @@
 /* Implementation of the raft_uv_transport interface, proxied by a dqlite
  * connection.
  *
- * Instead of having raft instances connect to each other directly, we pass a custom
- * connect function that causes dqlite to send a CONNECT request to the dqlite
- * server where the destination raft instance is running. That server responds to
- * the CONNECT request by forwarding the dqlite connection to its raft instance,
- * after which the raft-to-raft connection is transparent. */
+ * Instead of having raft instances connect to each other directly, we pass a
+ * custom connect function that causes dqlite to send a CONNECT request to the
+ * dqlite server where the destination raft instance is running. That server
+ * responds to the CONNECT request by forwarding the dqlite connection to its
+ * raft instance, after which the raft-to-raft connection is transparent. */
 #ifndef TRANSPORT_H_
 #define TRANSPORT_H_
 
 #include <raft/uv.h>
 
 #include "../include/dqlite.h"
+
+int transportDefaultConnect(void *arg, const char *address, int *fd);
 
 int raftProxyInit(struct raft_uv_transport *transport, struct uv_loop_s *loop);
 

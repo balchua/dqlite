@@ -14,6 +14,7 @@
 #include "lib/fs.h"
 #include "logger.h"
 #include "protocol.h"
+#include "roles.h"
 #include "tracing.h"
 #include "translate.h"
 #include "transport.h"
@@ -40,13 +41,15 @@ int dqlite__init(struct dqlite_node *d,
 
 	rv = snprintf(db_dir_path, sizeof db_dir_path, DATABASE_DIR_FMT, dir);
 	if (rv == -1 || rv >= (int)(sizeof db_dir_path)) {
-		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "failed to init: snprintf(rv:%d)", rv);
+		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+			 "failed to init: snprintf(rv:%d)", rv);
 		goto err;
 	}
 
 	rv = config__init(&d->config, id, address, db_dir_path);
 	if (rv != 0) {
-		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "config__init(rv:%d)", rv);
+		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+			 "config__init(rv:%d)", rv);
 		goto err;
 	}
 	rv = VfsInit(&d->vfs, d->config.name);
@@ -57,8 +60,8 @@ int dqlite__init(struct dqlite_node *d,
 	registry__init(&d->registry, &d->config);
 	rv = uv_loop_init(&d->loop);
 	if (rv != 0) {
-		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "uv_loop_init(): %s",
-			 uv_strerror(rv));
+		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+			 "uv_loop_init(): %s", uv_strerror(rv));
 		rv = DQLITE_ERROR;
 		goto err_after_vfs_init;
 	}
@@ -68,8 +71,8 @@ int dqlite__init(struct dqlite_node *d,
 	}
 	rv = raft_uv_init(&d->raft_io, &d->loop, dir, &d->raft_transport);
 	if (rv != 0) {
-		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "raft_uv_init(): %s",
-			 d->raft_io.errmsg);
+		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+			 "raft_uv_init(): %s", d->raft_io.errmsg);
 		rv = DQLITE_ERROR;
 		goto err_after_raft_transport_init;
 	}
@@ -94,10 +97,6 @@ int dqlite__init(struct dqlite_node *d,
 	raft_set_pre_vote(&d->raft, true);
 	raft_set_max_catch_up_rounds(&d->raft, 100);
 	raft_set_max_catch_up_round_duration(&d->raft, 50 * 1000); /* 50 secs */
-#ifdef __APPLE__
-	d->ready = dispatch_semaphore_create(0);
-	d->stopped = dispatch_semaphore_create(0);
-#else
 	rv = sem_init(&d->ready, 0, 0);
 	if (rv != 0) {
 		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "sem_init(): %s",
@@ -112,14 +111,24 @@ int dqlite__init(struct dqlite_node *d,
 		rv = DQLITE_ERROR;
 		goto err_after_ready_init;
 	}
-#endif
+	rv = sem_init(&d->handover_done, 0, 0);
+	if (rv != 0) {
+		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "sem_init(): %s",
+			 strerror(errno));
+		rv = DQLITE_ERROR;
+		goto err_after_stopped_init;
+	}
 
 	QUEUE__INIT(&d->queue);
 	QUEUE__INIT(&d->conns);
+	QUEUE__INIT(&d->roles_changes);
 	d->raft_state = RAFT_UNAVAILABLE;
 	d->running = false;
 	d->listener = NULL;
 	d->bind_address = NULL;
+	d->role_management = false;
+	d->connect_func = transportDefaultConnect;
+	d->connect_func_arg = NULL;
 
 	urandom = open("/dev/urandom", O_RDONLY);
 	assert(urandom != -1);
@@ -129,12 +138,10 @@ int dqlite__init(struct dqlite_node *d,
 	d->initialized = true;
 	return 0;
 
+err_after_stopped_init:
+	sem_destroy(&d->stopped);
 err_after_ready_init:
-#ifdef __APPLE__
-	dispatch_release(d->ready);
-#else
 	sem_destroy(&d->ready);
-#endif
 err_after_raft_fsm_init:
 	fsm__close(&d->raft_fsm);
 err_after_raft_io_init:
@@ -158,16 +165,16 @@ void dqlite__close(struct dqlite_node *d)
 		return;
 	}
 	raft_free(d->listener);
-#ifdef __APPLE__
-	dispatch_release(d->stopped);
-	dispatch_release(d->ready);
-#else
 	rv = sem_destroy(&d->stopped);
 	assert(rv == 0); /* Fails only if sem object is not valid */
 	rv = sem_destroy(&d->ready);
 	assert(rv == 0); /* Fails only if sem object is not valid */
-#endif
+	rv = sem_destroy(&d->handover_done);
+	assert(rv == 0);
 	fsm__close(&d->raft_fsm);
+	// TODO assert rv of uv_loop_close after fixing cleanup logic related to
+	// the TODO above referencing the cleanup logic without running the
+	// node. See https://github.com/canonical/dqlite/issues/504.
 	uv_loop_close(&d->loop);
 	raftProxyClose(&d->raft_transport);
 	registry__close(&d->registry);
@@ -206,7 +213,8 @@ int dqlite_node_set_bind_address(dqlite_node *t, const char *address)
 		return DQLITE_MISUSE;
 	}
 
-	rv = AddrParse(address, addr, &addr_len, "8080", DQLITE_ADDR_PARSE_UNIX);
+	rv =
+	    AddrParse(address, addr, &addr_len, "8080", DQLITE_ADDR_PARSE_UNIX);
 	if (rv != 0) {
 		return rv;
 	}
@@ -289,6 +297,9 @@ int dqlite_node_set_connect_func(dqlite_node *t,
 		return DQLITE_MISUSE;
 	}
 	raftProxySetConnectFunc(&t->raft_transport, f, arg);
+	/* Also save this info for use in automatic role management. */
+	t->connect_func = f;
+	t->connect_func_arg = arg;
 	return 0;
 }
 
@@ -300,8 +311,8 @@ int dqlite_node_set_network_latency(dqlite_node *t,
 		return DQLITE_MISUSE;
 	}
 
-        /* 1 hour latency should be more than sufficient, also avoids overflow
-         * issues when converting to unsigned milliseconds later on */
+	/* 1 hour latency should be more than sufficient, also avoids overflow
+	 * issues when converting to unsigned milliseconds later on */
 	if (nanoseconds > 3600000000000ULL) {
 		return DQLITE_MISUSE;
 	}
@@ -310,8 +321,7 @@ int dqlite_node_set_network_latency(dqlite_node *t,
 	return dqlite_node_set_network_latency_ms(t, milliseconds);
 }
 
-int dqlite_node_set_network_latency_ms(dqlite_node *t,
-				       unsigned milliseconds)
+int dqlite_node_set_network_latency_ms(dqlite_node *t, unsigned milliseconds)
 {
 	if (t->running) {
 		return DQLITE_MISUSE;
@@ -333,8 +343,9 @@ int dqlite_node_set_failure_domain(dqlite_node *n, unsigned long long code)
 	return 0;
 }
 
-int dqlite_node_set_snapshot_params(dqlite_node *n, unsigned snapshot_threshold,
-                                    unsigned snapshot_trailing)
+int dqlite_node_set_snapshot_params(dqlite_node *n,
+				    unsigned snapshot_threshold,
+				    unsigned snapshot_trailing)
 {
 	if (n->running) {
 		return DQLITE_MISUSE;
@@ -344,9 +355,9 @@ int dqlite_node_set_snapshot_params(dqlite_node *n, unsigned snapshot_threshold,
 		return DQLITE_MISUSE;
 	}
 
-	/* This is a safety precaution and allows to recover data from the second
-	 * last raft snapshot and segment files in case the last raft snapshot is
-	 * unusable. */
+	/* This is a safety precaution and allows to recover data from the
+	 * second last raft snapshot and segment files in case the last raft
+	 * snapshot is unusable. */
 	if (snapshot_trailing < snapshot_threshold) {
 		return DQLITE_MISUSE;
 	}
@@ -356,6 +367,32 @@ int dqlite_node_set_snapshot_params(dqlite_node *n, unsigned snapshot_threshold,
 	return 0;
 }
 
+#define KB(N) (1024 * N)
+int dqlite_node_set_block_size(dqlite_node *n, size_t size)
+{
+	if (n->running) {
+		return DQLITE_MISUSE;
+	}
+
+	switch (size) {
+		case 512:      // fallthrough
+		case KB(1):    // fallthrough
+		case KB(2):    // fallthrough
+		case KB(4):    // fallthrough
+		case KB(8):    // fallthrough
+		case KB(16):   // fallthrough
+		case KB(32):   // fallthrough
+		case KB(64):   // fallthrough
+		case KB(128):  // fallthrough
+		case KB(256):
+			break;
+		default:
+			return DQLITE_ERROR;
+	}
+
+	raft_uv_set_block_size(&n->raft_io, size);
+	return 0;
+}
 int dqlite_node_enable_disk_mode(dqlite_node *n)
 {
 	int rv;
@@ -391,7 +428,7 @@ static int maybeBootstrap(dqlite_node *d,
 		return 0;
 	}
 	raft_configuration_init(&configuration);
-	rv = raft_configuration_add(&configuration, id, address, true);
+	rv = raft_configuration_add(&configuration, id, address, RAFT_VOTER);
 	if (rv != 0) {
 		assert(rv == RAFT_NOMEM);
 		rv = DQLITE_NOMEM;
@@ -402,8 +439,8 @@ static int maybeBootstrap(dqlite_node *d,
 		if (rv == RAFT_CANTBOOTSTRAP) {
 			rv = 0;
 		} else {
-			snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "raft_bootstrap(): %s",
-				 raft_errmsg(&d->raft));
+			snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+				 "raft_bootstrap(): %s", raft_errmsg(&d->raft));
 			rv = DQLITE_ERROR;
 		}
 		goto out;
@@ -416,17 +453,18 @@ out:
 /* Callback invoked when the stop async handle gets fired.
  *
  * This callback will walk through all active handles and close them. After the
- * last handle (which must be the 'stop' async handle) is closed, the loop gets
- * stopped.
+ * last handle is closed, the loop gets stopped.
  */
 static void raftCloseCb(struct raft *raft)
 {
 	struct dqlite_node *s = raft->data;
 	raft_uv_close(&s->raft_io);
 	uv_close((struct uv_handle_s *)&s->stop, NULL);
+	uv_close((struct uv_handle_s *)&s->handover, NULL);
 	uv_close((struct uv_handle_s *)&s->startup, NULL);
 	uv_close((struct uv_handle_s *)&s->monitor, NULL);
 	uv_close((struct uv_handle_s *)s->listener, NULL);
+	uv_close((struct uv_handle_s *)&s->timer, NULL);
 }
 
 static void destroy_conn(struct conn *conn)
@@ -435,16 +473,47 @@ static void destroy_conn(struct conn *conn)
 	sqlite3_free(conn);
 }
 
-static void stop_cb(uv_async_t *stop)
+static void handoverDoneCb(struct dqlite_node *d, int status)
+{
+	d->handover_status = status;
+	sem_post(&d->handover_done);
+}
+
+static void handoverCb(uv_async_t *handover)
+{
+	struct dqlite_node *d = handover->data;
+	int rv;
+
+	/* Nothing to do. */
+	if (!d->running) {
+		return;
+	}
+
+	if (d->role_management) {
+		rv = uv_timer_stop(&d->timer);
+		assert(rv == 0);
+		RolesCancelPendingChanges(d);
+	}
+
+	RolesHandover(d, handoverDoneCb);
+}
+
+static void stopCb(uv_async_t *stop)
 {
 	struct dqlite_node *d = stop->data;
 	queue *head;
 	struct conn *conn;
+	int rv;
 
 	/* Nothing to do. */
 	if (!d->running) {
-	    tracef("not running or already stopped");
-	    return;
+		tracef("not running or already stopped");
+		return;
+	}
+	if (d->role_management) {
+		rv = uv_timer_stop(&d->timer);
+		assert(rv == 0);
+		RolesCancelPendingChanges(d);
 	}
 	d->running = false;
 
@@ -465,12 +534,8 @@ static void startup_cb(uv_timer_t *startup)
 	struct dqlite_node *d = startup->data;
 	int rv;
 	d->running = true;
-#ifdef __APPLE__
-	dispatch_semaphore_signal(d->ready);
-#else
 	rv = sem_post(&d->ready);
 	assert(rv == 0); /* No reason for which posting should fail */
-#endif
 }
 
 static void listenCb(uv_stream_t *listener, int status)
@@ -482,8 +547,8 @@ static void listenCb(uv_stream_t *listener, int status)
 	int rv;
 
 	if (!t->running) {
-	    tracef("not running");
-	    return;
+		tracef("not running");
+		return;
 	}
 
 	if (status != 0) {
@@ -521,7 +586,7 @@ static void listenCb(uv_stream_t *listener, int status)
 	/* We accept unix socket connections only from the same process. */
 	if (listener->type == UV_NAMED_PIPE) {
 		int fd = stream->io_watcher.fd;
-#if defined(SO_PEERCRED) // Linux
+#if defined(SO_PEERCRED)  // Linux
 		struct ucred cred;
 		socklen_t len = sizeof(cred);
 		rv = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len);
@@ -531,7 +596,7 @@ static void listenCb(uv_stream_t *listener, int status)
 		if (cred.pid != getpid()) {
 			goto err;
 		}
-#elif defined(LOCAL_PEERPID) // BSD
+#elif defined(LOCAL_PEERPID)  // BSD
 		pid_t pid = -1;
 		socklen_t len = sizeof(pid);
 		rv = getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len);
@@ -583,15 +648,24 @@ static void monitor_cb(uv_prepare_t *monitor)
 	}
 
 	if (d->raft_state == RAFT_LEADER && state != RAFT_LEADER) {
-		tracef("node %llu@%s: leadership lost", d->raft.id, d->raft.address);
+		tracef("node %llu@%s: leadership lost", d->raft.id,
+		       d->raft.address);
 		QUEUE__FOREACH(head, &d->conns)
 		{
 			conn = QUEUE__DATA(head, struct conn, queue);
-			gateway__leader_close(&conn->gateway, RAFT_LEADERSHIPLOST);
+			gateway__leader_close(&conn->gateway,
+					      RAFT_LEADERSHIPLOST);
 		}
 	}
 
 	d->raft_state = state;
+}
+
+/* Runs every tick on the main thread to kick off roles adjustment. */
+static void roleManagementTimerCb(uv_timer_t *handle)
+{
+	struct dqlite_node *d = handle->data;
+	RolesAdjust(d);
 }
 
 static int taskRun(struct dqlite_node *d)
@@ -608,9 +682,12 @@ static int taskRun(struct dqlite_node *d)
 	}
 	d->listener->data = d;
 
+	d->handover.data = d;
+	rv = uv_async_init(&d->loop, &d->handover, handoverCb);
+	assert(rv == 0);
 	/* Initialize notification handles. */
 	d->stop.data = d;
-	rv = uv_async_init(&d->loop, &d->stop, stop_cb);
+	rv = uv_async_init(&d->loop, &d->stop, stopCb);
 	assert(rv == 0);
 
 	/* Schedule startup_cb to be fired as soon as the loop starts. It will
@@ -628,17 +705,24 @@ static int taskRun(struct dqlite_node *d)
 	rv = uv_prepare_start(&d->monitor, monitor_cb);
 	assert(rv == 0);
 
+	/* Schedule the role management callback. */
+	d->timer.data = d;
+	rv = uv_timer_init(&d->loop, &d->timer);
+	assert(rv == 0);
+	if (d->role_management) {
+		/* TODO make the interval configurable */
+		rv = uv_timer_start(&d->timer, roleManagementTimerCb, 1000,
+				    1000);
+		assert(rv == 0);
+	}
+
 	d->raft.data = d;
 	rv = raft_start(&d->raft);
 	if (rv != 0) {
 		snprintf(d->errmsg, DQLITE_ERRMSG_BUF_SIZE, "raft_start(): %s",
 			 raft_errmsg(&d->raft));
 		/* Unblock any client of taskReady */
-#ifdef __APPLE__
-		dispatch_semaphore_signal(d->ready);
-#else
 		sem_post(&d->ready);
-#endif
 		return rv;
 	}
 
@@ -646,20 +730,34 @@ static int taskRun(struct dqlite_node *d)
 	assert(rv == 0);
 
 	/* Unblock any client of taskReady */
-#ifdef __APPLE__
-	dispatch_semaphore_signal(d->ready);
-#else
 	rv = sem_post(&d->ready);
 	assert(rv == 0); /* no reason for which posting should fail */
-#endif
 
+	return 0;
+}
+
+int dqlite_node_set_target_voters(dqlite_node *n, int voters)
+{
+	n->config.voters = voters;
+	return 0;
+}
+
+int dqlite_node_set_target_standbys(dqlite_node *n, int standbys)
+{
+	n->config.standbys = standbys;
+	return 0;
+}
+
+int dqlite_node_enable_role_management(dqlite_node *n)
+{
+	n->role_management = true;
 	return 0;
 }
 
 const char *dqlite_node_errmsg(dqlite_node *n)
 {
 	if (n != NULL) {
-	    return n->errmsg;
+		return n->errmsg;
 	}
 	return "node is NULL";
 }
@@ -692,11 +790,7 @@ void dqlite_node_destroy(dqlite_node *d)
 static bool taskReady(struct dqlite_node *d)
 {
 	/* Wait for the ready semaphore */
-#ifdef __APPLE__
-	dispatch_semaphore_wait(d->ready, DISPATCH_TIME_FOREVER);
-#else
 	sem_wait(&d->ready);
-#endif
 	return d->running;
 }
 
@@ -710,13 +804,15 @@ static int dqliteDatabaseDirSetup(dqlite_node *t)
 
 	rv = FsEnsureDir(t->config.dir);
 	if (rv != 0) {
-		snprintf(t->errmsg, DQLITE_ERRMSG_BUF_SIZE, "Error creating database dir: %d", rv);
+		snprintf(t->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+			 "Error creating database dir: %d", rv);
 		return rv;
 	}
 
 	rv = FsRemoveDirFiles(t->config.dir);
 	if (rv != 0) {
-		snprintf(t->errmsg, DQLITE_ERRMSG_BUF_SIZE, "Error removing files in database dir: %d", rv);
+		snprintf(t->errmsg, DQLITE_ERRMSG_BUF_SIZE,
+			 "Error removing files in database dir: %d", rv);
 		return rv;
 	}
 
@@ -761,6 +857,18 @@ err:
 	return rv;
 }
 
+int dqlite_node_handover(dqlite_node *d)
+{
+	int rv;
+
+	rv = uv_async_send(&d->handover);
+	assert(rv == 0);
+
+	sem_wait(&d->handover_done);
+
+	return d->handover_status;
+}
+
 int dqlite_node_stop(dqlite_node *d)
 {
 	tracef("dqlite node stop");
@@ -780,61 +888,64 @@ int dqlite_node_recover(dqlite_node *n,
 			struct dqlite_node_info infos[],
 			int n_info)
 {
-    tracef("dqlite node recover");
-    int i;
-    int ret;
+	tracef("dqlite node recover");
+	int i;
+	int ret;
 
-    struct dqlite_node_info_ext *infos_ext = calloc((size_t)n_info, sizeof(*infos_ext));
-    if (infos_ext == NULL) {
-        return DQLITE_NOMEM;
-    }
-    for (i = 0; i < n_info; i++) {
-        infos_ext[i].size = sizeof(*infos_ext);
-        infos_ext[i].id = infos[i].id;
-        infos_ext[i].address = PTR_TO_UINT64(infos[i].address);
-        infos_ext[i].dqlite_role = DQLITE_VOTER;
-    }
+	struct dqlite_node_info_ext *infos_ext =
+	    calloc((size_t)n_info, sizeof(*infos_ext));
+	if (infos_ext == NULL) {
+		return DQLITE_NOMEM;
+	}
+	for (i = 0; i < n_info; i++) {
+		infos_ext[i].size = sizeof(*infos_ext);
+		infos_ext[i].id = infos[i].id;
+		infos_ext[i].address = PTR_TO_UINT64(infos[i].address);
+		infos_ext[i].dqlite_role = DQLITE_VOTER;
+	}
 
-    ret = dqlite_node_recover_ext(n, infos_ext, n_info);
-    free(infos_ext);
-    return ret;
+	ret = dqlite_node_recover_ext(n, infos_ext, n_info);
+	free(infos_ext);
+	return ret;
 }
 
 static bool node_info_valid(struct dqlite_node_info_ext *info)
 {
-    /* Reject any size smaller than the original definition of the extensible
-     * struct. */
-    if (info->size < DQLITE_NODE_INFO_EXT_SZ_ORIG) {
-        return false;
-    }
+	/* Reject any size smaller than the original definition of the
+	 * extensible struct. */
+	if (info->size < DQLITE_NODE_INFO_EXT_SZ_ORIG) {
+		return false;
+	}
 
-    /* Require 8 byte allignment */
-    if (info->size % sizeof(uint64_t)) {
-        return false;
-    }
+	/* Require 8 byte allignment */
+	if (info->size % sizeof(uint64_t)) {
+		return false;
+	}
 
-    /* If the user uses a newer, and larger version of the struct, make sure the unknown
-     * fields are zeroed out. */
-    uint64_t known_size = sizeof(struct dqlite_node_info_ext);
-    if (info->size > known_size) {
-        const uint64_t num_known_fields = known_size / sizeof(uint64_t);
-        const uint64_t num_extra_fields = (info->size - known_size) / sizeof(uint64_t);
-        const uint64_t *extra_fields = ((const uint64_t *)info) + num_known_fields;
-        for (uint64_t i = 0; i < num_extra_fields; i++) {
-            if (extra_fields[i] != (uint64_t)0) {
-                return false;
-            }
-        }
-    }
+	/* If the user uses a newer, and larger version of the struct, make sure
+	 * the unknown fields are zeroed out. */
+	uint64_t known_size = sizeof(struct dqlite_node_info_ext);
+	if (info->size > known_size) {
+		const uint64_t num_known_fields = known_size / sizeof(uint64_t);
+		const uint64_t num_extra_fields =
+		    (info->size - known_size) / sizeof(uint64_t);
+		const uint64_t *extra_fields =
+		    ((const uint64_t *)info) + num_known_fields;
+		for (uint64_t i = 0; i < num_extra_fields; i++) {
+			if (extra_fields[i] != (uint64_t)0) {
+				return false;
+			}
+		}
+	}
 
-    return true;
+	return true;
 }
 
 int dqlite_node_recover_ext(dqlite_node *n,
-			struct dqlite_node_info_ext infos[],
-			int n_info)
+			    struct dqlite_node_info_ext infos[],
+			    int n_info)
 {
-    	tracef("dqlite node recover ext");
+	tracef("dqlite node recover ext");
 	struct raft_configuration configuration;
 	int i;
 	int rv;
@@ -843,13 +954,14 @@ int dqlite_node_recover_ext(dqlite_node *n,
 	for (i = 0; i < n_info; i++) {
 		struct dqlite_node_info_ext *info = &infos[i];
 		if (!node_info_valid(info)) {
-		    rv = DQLITE_MISUSE;
-                    goto out;
+			rv = DQLITE_MISUSE;
+			goto out;
 		}
 		int raft_role = translateDqliteRole((int)info->dqlite_role);
-		const char *address = UINT64_TO_PTR(info->address, const char *);
-		rv = raft_configuration_add(&configuration, info->id,
-					    address, raft_role);
+		const char *address =
+		    UINT64_TO_PTR(info->address, const char *);
+		rv = raft_configuration_add(&configuration, info->id, address,
+					    raft_role);
 		if (rv != 0) {
 			assert(rv == RAFT_NOMEM);
 			rv = DQLITE_NOMEM;

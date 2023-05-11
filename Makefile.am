@@ -10,6 +10,7 @@ endif
 include_HEADERS = include/dqlite.h
 
 lib_LTLIBRARIES = libdqlite.la
+libdqlite_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden
 libdqlite_la_LDFLAGS = $(AM_LDFLAGS) -version-info 0:1:0
 libdqlite_la_SOURCES = \
   src/bind.c \
@@ -36,6 +37,7 @@ libdqlite_la_SOURCES = \
   src/registry.c \
   src/request.c \
   src/response.c \
+  src/roles.c \
   src/server.c \
   src/stmt.c \
   src/tracing.c \
@@ -86,6 +88,7 @@ unit_test_SOURCES += \
   test/unit/test_registry.c \
   test/unit/test_replication.c \
   test/unit/test_request.c \
+  test/unit/test_role_management.c \
   test/unit/test_tuple.c \
   test/unit/test_vfs.c \
   test/unit/main.c
@@ -99,6 +102,7 @@ integration_test_SOURCES = \
   test/integration/test_fsm.c \
   test/integration/test_membership.c \
   test/integration/test_node.c \
+  test/integration/test_role_management.c \
   test/integration/test_vfs.c \
   test/integration/main.c
 integration_test_CFLAGS = $(AM_CFLAGS) -Wno-conversion
